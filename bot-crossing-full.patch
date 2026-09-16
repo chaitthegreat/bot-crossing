@@ -1,0 +1,3281 @@
+From f9ae61258e616c9454e6ad93def9408ec30b29a3 Mon Sep 17 00:00:00 2001
+From: "dojacatbrightfire[bot]"
+ <296164176+dojacatbrightfire[bot]@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 14:52:58 -0500
+Subject: [PATCH] feat: OpenClaw harness adapter with full colony integration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add OpenClaw as a harness for Bot Crossing, scanning 2,680+ sessions
+across multiple agent directories with smart project detection,
+session classification, and cost tracking.
+
+Harness adapter (server/harnesses/openclaw.mjs):
+- Scans ~/.openclaw/agents/*/sessions/*.jsonl for all session data
+- Smart project detection: parses file paths and GitHub refs to map
+  sessions to actual repos (c2, ads-platform, C2UI, etc.) — 16 zones
+- Session classification: webhook, cron, subagent, conversation, heartbeat
+- Slack channel tagging from inbound metadata
+- Cost/token tracking from usage data in assistant messages
+- Git branch detection from worktree cwds and .git/HEAD
+- Title cleaning: strips system metadata, webhook envelopes, cron brackets
+- Thinking detection: identifies model processing vs tool execution
+- Sticky running state: 60s hold prevents stat bar flickering
+- PR detection (stored in ref, celebrating status disabled as too noisy)
+- Deep linking via OPENCLAW_URL env var (default: localhost:18789)
+
+Thinking status (new colony status):
+- Purple trim, blue-violet eyes, Idle_B body animation
+- Thinking face loop (think1/2/3 — thought bubble dots)
+- Purple thought particles drifting above head
+- Dedicated badge, stat bar entry, and help legend
+
+Transcript viewer:
+- Read-only chat panel in the thread card sidebar
+- User/assistant messages with model, timestamps, tool-use badges
+- Live transcript tail: auto-updates every 3s for active sessions
+  with pulsing LIVE badge and smart auto-scroll
+
+Open button fix:
+- Server returns http/https URLs to client without trying xdg-open
+- Client opens URL in new tab (guarded to http/https only)
+- Button label: 'Open in OpenClaw' (dynamic per harness)
+
+Session search:
+- GET /api/search?q= endpoint with 10s thread cache
+- Debounced search panel (F or / to open), fly-to-astronaut on click
+- Max 20 results with title, project, model, time ago
+
+Activity timeline:
+- GET /api/activity endpoint with hourly buckets
+- GitHub-style heatmap (week columns, Mon-Sun rows)
+- Date range presets (7d/30d/90d/All) + custom date inputs
+- Time machine: filters colony to selected date range
+- Click a day cell to filter to that day
+- Filter badge with clear button
+
+Model heatmap:
+- Zones colored by dominant model (Opus purple, GLM green, etc.)
+- Settings toggle, legend in sidebar
+
+Auto-archive:
+- Settings toggle with configurable dormancy threshold (7-365 days)
+- Max 50 archives per poll, toast notification
+
+Stat bar consistency:
+- statusAgents cache ensures click always finds the counted agent
+- Active threads sort to front of roster (above maxAgents cap)
+- Zero-count stats hidden
+---
+ package-lock.json             |   2 +-
+ server/api.mjs                | 104 ++++-
+ server/harnesses/README.md    |   1 +
+ server/harnesses/index.mjs    |   3 +-
+ server/harnesses/openclaw.mjs | 848 ++++++++++++++++++++++++++++++++++
+ server/scan.mjs               |  14 +
+ src/agents/astronauts.js      |   7 +
+ src/agents/indicators.js      |  46 +-
+ src/agents/particles.js       |  24 +
+ src/core/settings.js          |  13 +
+ src/game/api.js               |  17 +
+ src/game/colony.js            |  94 +++-
+ src/main.js                   | 168 ++++++-
+ src/ui/hud.js                 | 675 ++++++++++++++++++++++++++-
+ src/ui/styles.css             | 535 ++++++++++++++++++++-
+ 15 files changed, 2508 insertions(+), 43 deletions(-)
+ create mode 100644 server/harnesses/openclaw.mjs
+
+diff --git a/package-lock.json b/package-lock.json
+index 7763645..04f3b05 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -23,7 +23,7 @@
+         "vite": "^7.1.0"
+       },
+       "engines": {
+-        "node": ">=20"
++        "node": ">=22.13"
+       }
+     },
+     "node_modules/@emnapi/runtime": {
+diff --git a/server/api.mjs b/server/api.mjs
+index f661314..e6a2af3 100644
+--- a/server/api.mjs
++++ b/server/api.mjs
+@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
+ import { openInTerminal, schemeHasHandler, schemeOf } from './lib/xdg.mjs'
+ import {
+   defaultHarness,
++  getTranscript as harnessGetTranscript,
+   harnessStatus,
+   newSession as harnessNewSession,
+   openThread as harnessOpenThread,
+@@ -200,6 +201,14 @@ async function present(result) {
+     return { ok: true, url: result.url }
+   }
+ 
++  // http/https URLs are always openable client-side — the page asking is the one thing on
++  // this machine that can follow them — so hand the URL back without launching anything
++  // here. A headless Linux box has no xdg-open and no display, and `schemeHasHandler`
++  // rightly says no; this is what makes "Open" work on one anyway.
++  const scheme = schemeOf(result.url)
++  if (scheme === 'http' || scheme === 'https') {
++    return { ok: true, url: result.url }
++  }
+   if (result.url && (await schemeHasHandler(result.url))) {
+     launch(result.url)
+     return { ok: true, url: result.url }
+@@ -214,7 +223,6 @@ async function present(result) {
+     if (!enterable) return { ok: false, error: 'The folder that thread ran in cannot be entered' }
+     return openInTerminal(result.command.argv, cwd)
+   }
+-  const scheme = schemeOf(result.url)
+   return {
+     ok: false,
+     error: scheme
+@@ -282,6 +290,28 @@ function send(res, status, body) {
+ 
+ const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
+ 
++/**
++ * The last scan, kept warm between polls.
++ *
++ * `/api/threads` is asked on a poll, where scanning from scratch is the point. But anything
++ * that answers a keystroke — the search box — wants the list *now*, and a full disk scan
++ * per query would make filtering feel like the colony is thinking. The cache is short
++ * enough that a poll never sees a stale list (the page asks every 15s, this expires in 10),
++ * and an empty result is never cached: a scan that found nothing is far more likely to be
++ * a harness mid-restart than a machine with no threads on it.
++ */
++const THREAD_CACHE_MS = 10_000
++let threadCache = { at: 0, threads: [] }
++
++async function currentThreads() {
++  if (threadCache.threads.length && Date.now() - threadCache.at < THREAD_CACHE_MS) {
++    return threadCache.threads
++  }
++  const threads = await reconcileArchived(await scanThreads())
++  threadCache = { at: Date.now(), threads }
++  return threads
++}
++
+ // The machine's own LAN addresses count as local too, so the colony can be
+ // served to the home network with BOT_CROSSING_HOST set. Harmless when bound
+ // to loopback (those hosts can't reach the server anyway), and the Host +
+@@ -363,13 +393,68 @@ export async function apiMiddleware(req, res, next) {
+ 
+   try {
+     if (url.pathname === '/api/threads' && req.method === 'GET') {
+-      const threads = await reconcileArchived(await scanThreads())
++      const threads = await currentThreads()
+       // A harness that is present but cannot read its own store says so here, rather than
+       // appearing healthy in the list while quietly contributing nothing.
+       const warnings = (await harnessStatus()).filter((h) => h.detected && h.error).map((h) => h.error)
+       return send(res, 200, { threads, scannedAt: Date.now(), warnings })
+     }
+ 
++    /**
++     * Sessions by substring, over the same reconciled list `/api/threads` serves — so what
++     * the search finds is exactly what is on the map (plus the archived, which carry their
++     * flag and are harmless to offer: the page says where they went instead of flying).
++     * Titles and previews only; two characters minimum, twenty results maximum, case-blind.
++     */
++    if (url.pathname === '/api/search' && req.method === 'GET') {
++      const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
++      if (q.length < 2) return send(res, 200, { results: [] })
++      const threads = await currentThreads()
++      const results = []
++      for (const t of threads) {
++        const title = String(t.title || '').toLowerCase()
++        const preview = String(t.preview || '').toLowerCase()
++        if (!title.includes(q) && !preview.includes(q)) continue
++        results.push({
++          id: t.id,
++          title: t.title || 'Untitled session',
++          project: t.project || '',
++          model: t.model || '',
++          lastActivityAt: t.lastActivityAt || 0,
++          archived: Boolean(t.archived),
++        })
++        if (results.length >= 20) break
++      }
++      return send(res, 200, { results })
++    }
++
++    /**
++     * Session activity over time, for the timeline panel: every thread's last move
++     * dropped into the hour it happened in, within the window asked for. Hourly buckets
++     * keyed `YYYY-MM-DD-HH`, in this machine's own timezone — the page only ever runs on
++     * the machine the server is on, so the two never disagree about when "today" starts.
++     * The thread list is the same reconciled one the map is drawn from, so the heatmap and
++     * the colony always describe the same sessions.
++     */
++    if (url.pathname === '/api/activity' && req.method === 'GET') {
++      const askedFrom = Date.parse(url.searchParams.get('from') || '')
++      const askedTo = Date.parse(url.searchParams.get('to') || '')
++      const fromMs = Number.isFinite(askedFrom) ? askedFrom : Date.now() - 30 * 86400000
++      const toMs = Number.isFinite(askedTo) ? askedTo : Date.now()
++      const threads = await currentThreads()
++      const buckets = {}
++      for (const t of threads) {
++        const ts = t.lastActivityAt || t.createdAt
++        if (!ts || ts < fromMs || ts > toMs) continue
++        const d = new Date(ts)
++        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
++          d.getDate()
++        ).padStart(2, '0')}-${String(d.getHours()).padStart(2, '0')}`
++        buckets[key] = (buckets[key] || 0) + 1
++      }
++      return send(res, 200, { buckets, from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString() })
++    }
++
+     if (url.pathname === '/api/harnesses' && req.method === 'GET') {
+       return send(res, 200, { harnesses: await harnessStatus() })
+     }
+@@ -411,6 +496,21 @@ export async function apiMiddleware(req, res, next) {
+       return send(res, shown.ok ? 200 : 400, shown)
+     }
+ 
++    /**
++     * The conversation behind a thread, read back by whichever harness owns it.
++     *
++     * The `ref` arrives straight from the page, exactly as `/api/open` receives it, and is
++     * just as opaque here: the adapter is the one that pattern-checks it before anything on
++     * disk is touched. A harness with no transcript to read — or one that is not installed —
++     * answers `{ ok: false }`, which the card shows as its empty state rather than an error,
++     * because a thread you cannot read here is still a thread you can open.
++     */
++    if (url.pathname === '/api/transcript' && req.method === 'POST') {
++      const { harness, ref } = await readJsonBody(req)
++      const result = await harnessGetTranscript(harness, ref)
++      return send(res, result.ok ? 200 : 400, result)
++    }
++
+     if ((url.pathname === '/api/new-session' || url.pathname === '/api/reveal') && req.method === 'POST') {
+       const { folder, harness } = await readJsonBody(req)
+       const dir = await resolveFolder(folder)
+diff --git a/server/harnesses/README.md b/server/harnesses/README.md
+index 8eb4fb0..ab57364 100644
+--- a/server/harnesses/README.md
++++ b/server/harnesses/README.md
+@@ -89,6 +89,7 @@ what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map
+ | `lastActivityAt` | number | Epoch ms. Sorts the colony and drives the "asleep for 3 days" behaviour |
+ | `lastFocusedAt` | number | Epoch ms, `0` if unknowable |
+ | `running` | boolean | Working **right now** — the astronaut hammers away |
++| `thinking` | boolean | The model is processing fresh input — the astronaut stands with a thought bubble, purple trim |
+ | `unread` | boolean | Moved on since you last looked — the astronaut stops and holds a `?` |
+ | `hasError` | boolean | Errored — the astronaut slumps, red eyes |
+ | `starred` / `routine` / `prState` | | Optional extras; `prState: 'merged'` triggers the confetti |
+diff --git a/server/harnesses/index.mjs b/server/harnesses/index.mjs
+index 044de5c..b3c5314 100644
+--- a/server/harnesses/index.mjs
++++ b/server/harnesses/index.mjs
+@@ -9,8 +9,9 @@
+ import claudeCode from './claude-code.mjs'
+ import codex from './codex.mjs'
+ import cursor from './cursor.mjs'
++import openclaw from './openclaw.mjs'
+ 
+-export const HARNESSES = [claudeCode, codex, cursor]
++export const HARNESSES = [claudeCode, codex, cursor, openclaw]
+ 
+ export const harnessById = (id) => HARNESSES.find((h) => h.id === id) || null
+ 
+diff --git a/server/harnesses/openclaw.mjs b/server/harnesses/openclaw.mjs
+new file mode 100644
+index 0000000..84f47e3
+--- /dev/null
++++ b/server/harnesses/openclaw.mjs
+@@ -0,0 +1,848 @@
++/**
++ * Harness adapter: OpenClaw — the agent gateway this machine itself runs on.
++ *
++ * Everything that knows the shape of OpenClaw's own files lives in this one module, per the
++ * contract in `server/harnesses/README.md`. Sessions are JSONL transcripts under
++ * `~/.openclaw/agents/<agentId>/sessions/`, one file per conversation, each opening with a
++ * `{"type":"session", …}` header line carrying the id, the start time and the cwd.
++ *
++ * Beside the plain `<uuid>.jsonl` transcripts the directory holds per-topic continuations
++ * (`<uuid>-topic-<ts>.jsonl` — a Slack thread spun out of a session, with the parent's id in
++ * its header), trajectory mirrors (`.trajectory.jsonl`), checkpoint snapshots
++ * (`.checkpoint.<uuid>.jsonl`), path sidecars, and deleted-file tombstones (`.deleted.<ts>`).
++ * Only the conversation transcripts are read here; the topic files are included because they
++ * are real conversations, and each carries the session id in its header, so they key cleanly.
++ *
++ * The head also names the *repo* a session actually worked on. Almost every session starts in
++ * the shared workspace, so `cwd` alone would pile every project onto one plot; the repo is
++ * voted out of the paths, GitHub refs and command lines the transcript mentions — see
++ * `detectProject`.
++ *
++ * The transcript head is also where the *kind* of a session shows. OpenClaw writes no
++ * parent-child metadata, but the openings are distinctive: a webhook arrives as
++ * `Task: <source> | Job ID: …` wrapped around an untrusted-content fence, a cron fire as
++ * `[cron:<id> <label>]`, a heartbeat poll as its own fixed line, and a spawned sub-agent as a
++ * `[Subagent Context]` opener under an agent other than `main`. Cost arrives the same way —
++ * `usage.cost.total` on every assistant message — so a session's spend is summed out of the
++ * head plus the tail without reading a long transcript whole. All of it is cached against
++ * mtime and size, exactly like the rest of the metadata.
++ *
++ * Read-only, without exception. OpenClaw writes these files while it works; this adapter only
++ * ever opens them for reading and never writes one byte back.
++ */
++import fsp from 'node:fs/promises'
++import path from 'node:path'
++import os from 'node:os'
++import { exists, jsonLines, listDirs, listFiles, readHead, readTail } from '../lib/fsutil.mjs'
++
++const HOME = os.homedir()
++/** Every agent's transcripts live under here: `~/.openclaw/agents/<agentId>/sessions/`. */
++const AGENTS = path.join(HOME, '.openclaw', 'agents')
++
++/**
++ * The head carries all the metadata there is: the session header, the model/thinking-level
++ * changes, the first user message, the runtime-context records that say where the session
++ * came from, and the first stretch of assistant usage. 64KB has covered every transcript
++ * tried against it, and `readHead` drops a trailing partial line so a file mid-write parses
++ * cleanly anyway.
++ */
++const HEAD_BYTES = 64 * 1024
++/**
++ * The tail of a long session carries its latest usage records. Cost is summed from the head
++ * plus the tail, so a session that ran for hours still reports what it spent — the middle of
++ * a very long transcript is knowingly left unread.
++ */
++const TAIL_BYTES = 64 * 1024
++/** Smaller than this is a stub or a truncated write, not a conversation. */
++const MIN_SIZE = 100
++/** First messages and runtime context are capped before caching — titles only need the start. */
++const PROMPT_MAX = 8 * 1024
++/** How much runtime-context to keep for classification, per session. */
++const CONTEXT_MAX = 8 * 1024
++/**
++ * How much of a transcript the chat panel reads. All but a handful of sessions on a real
++ * machine sit well under this, so it is the whole conversation; the rare giant is read to
++ * the cap and honestly truncated at its head, the same trade the scan's windows make.
++ */
++const TRANSCRIPT_MAX_BYTES = 1024 * 1024
++/** A single message is capped before it crosses the wire — the panel clips for display anyway. */
++const TRANSCRIPT_MSG_MAX = 4000
++
++/**
++ * How recently a transcript must have moved to be worth a live probe. Older than this and the
++ * session is simply over; the mtime answers on its own.
++ */
++const ACTIVE_WINDOW_MS = 2 * 60 * 1000
++/**
++ * Within this window a session may still be running, and pays for a double-stat probe to
++ * find out — see `checkRunning`. Inside it, a file that is not growing can still be
++ * *thinking*: input landed moments ago and the model has not begun writing its reply yet,
++ * so the tail is read to tell that apart from a session that simply ended.
++ */
++const FRESH_WINDOW_MS = 60 * 1000
++/** The pause between the two stats of `checkRunning`, long enough for a write to land. */
++const PROBE_DELAY_MS = 150
++/** How much tail `checkRunning` reads to tell "thinking" from "done" — the last record only. */
++const THINKING_TAIL_BYTES = 32 * 1024
++
++/**
++ * Every id this adapter hands out is prefixed with the harness and the agent, so ids stay
++ * unique across harnesses and across agents — two agents never share a session namespace.
++ */
++const ID = (agentId, sessionId) => `openclaw:${agentId}:${sessionId}`
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
++// Session ids are UUIDs and agent ids are directory names; both are pattern-checked before
++// they reach the URL builder, because `ref` makes a round trip through the browser.
++const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
++
++const isUuid = (v) => typeof v === 'string' && UUID.test(v)
++const isAgentId = (v) => typeof v === 'string' && AGENT_ID.test(v)
++
++/** Where the web UI is. The gateway's own port, overridable for a non-default install. */
++const webUrl = () =>
++  (process.env.OPENCLAW_URL || `http://${process.env.OPENCLAW_HOST || 'localhost'}:${process.env.OPENCLAW_PORT || '18789'}`)
++
++/** Clip to a length, marking the cut with an ellipsis. */
++const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s)
++
++/**
++ * A transcript file is a `.jsonl` that is none of the sidecars: not a trajectory mirror, not
++ * a deleted-file tombstone, and not a `.checkpoint.` snapshot. Checkpoints are recovery
++ * artifacts — copies of a conversation at a moment, written beside it — and when the parent
++ * transcript has since been pruned the checkpoint is a ghost of a session the gateway itself
++ * no longer lists, so it is left out rather than shown as a thread that cannot open.
++ */
++const isTranscript = (name) =>
++  name.endsWith('.jsonl') &&
++  !name.includes('.trajectory') &&
++  !name.includes('.deleted.') &&
++  !name.includes('.checkpoint.')
++
++function firstText(content) {
++  if (typeof content === 'string') return content
++  if (Array.isArray(content)) {
++    for (const part of content) {
++      if (typeof part === 'string') return part
++      if (part && part.type === 'text' && typeof part.text === 'string') return part.text
++    }
++  }
++  return ''
++}
++
++/**
++ * Turn a raw first message into what a person would say the thread is about.
++ *
++ * OpenClaw wraps almost everything it hands the model — webhook payloads inside untrusted-
++ * content fences, cron fires in `[cron:<id> <label>]` brackets, Slack origins in
++ * `System (untrusted)` prefaces, media instructions in `[media attached: …]` blocks. Each
++ * wrapper is stripped in the order the wrappers actually nest, until what is left is the
++ * message itself. Pure scaffolding — a sub-agent opener, whose real task lives in the system
++ * prompt — comes back empty so the caller can fall back to the first thing the worker said.
++ */
++function cleanMessage(raw) {
++  let s = String(raw || '')
++  if (s.startsWith('[OpenClaw heartbeat poll]')) return 'Heartbeat poll'
++  // Cron fires open with `[cron:<id> <label>]` — the label is the identity, the rest is machinery.
++  s = s.replace(/^\[cron:[0-9a-f-]+ ([^\]]*)\]\s*/, (_m, label) => (label ? `${label}: ` : ''))
++  // Webhook/cron envelope: `Task: <source> | Job ID: … | Received: …` — one metadata line.
++  if (s.startsWith('Task: ') && s.includes('| Job ID:')) s = s.replace(/^Task:[^\n]*\| Job ID:[^\n]*\n+/, '')
++  // The payload itself sits inside an untrusted-content fence behind a `Source: …` header;
++  // a fenceless security notice is cut after its last boilerplate bullet instead.
++  const fenced = /<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\n?([\s\S]*?)<<<END_EXTERNAL_UNTRUSTED_CONTENT/.exec(s)
++  if (fenced) {
++    s = fenced[1].replace(/^Source:[^\n]*\n---\n?/, '')
++  } else if (s.includes('SECURITY NOTICE:')) {
++    s = s.replace(/^[\s\S]*?Send messages to third parties[^\n]*\n+/, '')
++  }
++  // Slack prefaces: `System (untrusted): [ts] Slack DM from <name>: …` — the message is the rest.
++  s = s.replace(/^System \(untrusted\): \[[^\]]*\]\s*/, '')
++  s = s.replace(/^(?:Slack DM from [^:\n]+|Slack message in #[^\s:]+ from [^:\n]+):\s*/, '')
++  // Inbound metadata blocks trail the message they describe — cut at the first of them.
++  for (const marker of ['Conversation info (untrusted metadata)', 'Sender (untrusted metadata)']) {
++    const at = s.indexOf(marker)
++    if (at >= 0) s = s.slice(0, at)
++  }
++  s = s.replace(/\n?Current time:[^\n]*$/, '')
++  // Media instructions and gateway timestamps lead the message body proper.
++  s = s.replace(/^\[media attached:[^\]]*\]\s*/, '')
++  s = s.replace(/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]* \d{4}-\d{2}-\d{2} [\d:]+ [A-Z]{2,5}\]\s*/, '')
++  // Sub-agent openers are pure scaffolding: the task is in the system prompt, not here.
++  s = s.replace(/^\[Subagent Context\]\s*/, '')
++  if (s.startsWith('You are running as a subagent')) return ''
++  // A plain `Task: …` opener names a task — keep the task, drop the label.
++  s = s.replace(/^Task:\s*/, '')
++  // Whatever tag-wrapped noise is left (runtime context, hook payloads), and the whitespace.
++  s = s.replace(/<([a-z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g, ' ')
++  return s.replace(/\s+/g, ' ').trim()
++}
++
++/**
++ * What kind of session this is, from the shape of its first user message and the agent that
++ * ran it. The message-level shapes are tested before the agent, because a heartbeat or a
++ * cron that fires on a worker agent is still a heartbeat or a cron, not a sub-agent task:
++ *
++ *   - `[OpenClaw heartbeat poll]` — the gateway polling an agent
++ *   - `[cron:<id> <label>]` — a scheduled fire
++ *   - `Task: <source> | Job ID: …` — a webhook (Hook, GitHub, …) or a cron delivery
++ *   - the SECURITY NOTICE fence — an external, untrusted payload
++ *   - and, failing all of that, an agent other than `main` — or a `[Subagent Context]`
++ *     opener under any agent — which is a spawned worker by construction
++ */
++function classifySession(agentId, text) {
++  if (text.startsWith('[OpenClaw heartbeat poll]')) return { type: 'heartbeat', routine: 'heartbeat' }
++  if (text.startsWith('[cron:')) return { type: 'cron', routine: 'cron' }
++  const task = /^Task: ([^|\n]+)/.exec(text)
++  if (task && text.includes('| Job ID:')) {
++    return task[1].trim().toLowerCase() === 'cron'
++      ? { type: 'cron', routine: 'cron' }
++      : { type: 'webhook', routine: 'webhook' }
++  }
++  if (text.includes('SECURITY NOTICE: The following content is from an EXTERNAL')) {
++    return { type: 'webhook', routine: 'webhook' }
++  }
++  if (agentId !== 'main' || text.includes('[Subagent Context]')) {
++    return { type: 'subagent', routine: 'subagent' }
++  }
++  return { type: 'conversation', routine: '' }
++}
++
++/**
++ * Where a Slack-originated session came in from, read off the first message and the
++ * runtime-context records beside it — the transcript's own `System (untrusted)` preface says
++ * "DM from <name>" or "message in #<channel>", and the inbound metadata block says
++ * `"channel": "slack"` when neither spelling shows. That last marker is only trusted in
++ * runtime context: the same key appears in tool traffic for messages the agent *sent*,
++ * which says nothing about where the session came from.
++ */
++function slackTagOf(userText, contextText) {
++  const text = `${userText}\n${contextText}`
++  if (/Slack message in #[^\s:"\\]+/.test(text)) return 'slack-channel'
++  if (/Slack DM from /.test(text)) return 'slack-dm'
++  if (contextText.includes('"channel": "slack"')) return 'slack'
++  return ''
++}
++
++/**
++ * The repo a session actually worked on, read out of what its transcript head says rather
++ * than where it was launched. Nearly every OpenClaw session starts in the shared workspace,
++ * so `cwd` alone would pile every project onto one plot — the head names the real work as
++ * file paths in tool calls, GitHub refs in task text, and `cd`/docker/git command lines, and
++ * the most-mentioned repo wins the vote. A `cwd` already under `repos/` answers first: a
++ * checkout of its own is the one source that cannot be a misread. `gpt-skills` is skipped
++ * on the mention count — it holds skills, not a project anyone would want a zone for.
++ *
++ * Returns `{ project, projectPath }`, or null when nothing names a repo and the caller
++ * should keep its cwd-based answer.
++ */
++const REPO_PATH = /\/repos\/([a-zA-Z0-9_-]+)(?![a-zA-Z0-9_-])/g
++const GITHUB_REF = /(?:brightfire|chaitthegreat)\/([a-zA-Z0-9_-]+)/g
++
++function detectProject(records, cwd) {
++  const cwdMatch = /\/repos\/([^/]+)/.exec(cwd || '')
++  if (cwdMatch) return { project: cwdMatch[1], projectPath: cwd }
++  const mentions = new Map()
++  const count = (name) => {
++    if (!name || name === 'gpt-skills') return
++    mentions.set(name, (mentions.get(name) || 0) + 1)
++  }
++  for (const r of records) {
++    // Brute force, but the regexes are specific enough to earn it: one stringify catches
++    // repo names in every place a transcript has of writing them — tool-call paths, PR refs
++    // in task text, command lines — without walking each record's shape by hand.
++    let text
++    try {
++      text = JSON.stringify(r)
++    } catch {
++      continue
++    }
++    for (const m of text.matchAll(REPO_PATH)) count(m[1])
++    for (const m of text.matchAll(GITHUB_REF)) count(m[1])
++  }
++  let best = ''
++  let bestCount = 0
++  for (const [name, n] of mentions) {
++    if (n > bestCount) {
++      best = name
++      bestCount = n
++    }
++  }
++  if (!best) return null
++  return { project: best, projectPath: path.join(HOME, 'repos', best) }
++}
++
++/**
++ * The pull request a session worked on, when its head says so. Transcripts mention PRs
++ * two ways — a GitHub URL (`github.com/<owner>/<repo>/pull/<n>`) or plain text ("PR #123",
++ * "pull request 123") — and the *last* mention in the head wins, because a session that
++ * opened a PR and then saw it merged tells the story in that order. State is read from the
++ * same record as the mention: the words around "PR #123 was merged" are what carry it, and
++ * a later record that names the number again can supersede the state. A mention with no
++ * state words at all leaves whatever the earlier records said.
++ *
++ * Deliberately head-only: a merge landing deep in a long transcript is not seen, the same
++ * trade every other question here makes about the cost of reading a file whole.
++ */
++const PR_URL_PATTERN = /github\.com\/([^/\s"']+?)\/([^/\s"']+?)\/pull\/(\d+)/g
++const PR_TEXT_PATTERN = /\b(?:PR|pull request)s?\s*#?(\d+)/gi
++
++/** The words a transcript uses to say what happened to a PR, in the order they should win. */
++function prStateOf(text) {
++  const t = String(text).toLowerCase()
++  if (t.includes('merged') || t.includes('gh pr merge')) return 'MERGED'
++  if (t.includes('approved')) return 'APPROVED'
++  if (t.includes('closed')) return 'CLOSED'
++  if (t.includes('draft')) return 'DRAFT'
++  return ''
++}
++
++function detectPr(records) {
++  let pr = null
++  for (const r of records) {
++    let text
++    try {
++      text = JSON.stringify(r)
++    } catch {
++      continue
++    }
++    let hit = null
++    for (const m of text.matchAll(PR_URL_PATTERN)) hit = { number: m[3], repo: m[2] }
++    if (!hit) {
++      for (const m of text.matchAll(PR_TEXT_PATTERN)) hit = { number: m[1], repo: '' }
++    }
++    if (!hit) continue
++    const state = prStateOf(text)
++    pr = {
++      number: hit.number,
++      repo: hit.repo || pr?.repo || '',
++      state: state || (pr?.number === hit.number ? pr.state : '') || '',
++    }
++  }
++  return pr
++}
++
++/**
++ * Pull whatever a transcript head knows about itself. The session header leads the file and
++ * is the only source for the id, the start time and the cwd; the model arrives either as a
++ * `model_change` event or on the first assistant message, and the thinking level as a
++ * `thinking_level_change` event. Cost rides on every assistant message's `usage`, so the
++ * head's messages are summed as they are read. Anything absent stays absent — an adapter
++ * reports what is there rather than inventing the rest.
++ */
++function readTranscriptMeta(records) {
++  const meta = {
++    sessionId: '',
++    startedAt: 0,
++    cwd: '',
++    firstUserText: '',
++    firstAssistantText: '',
++    contextText: '',
++    model: '',
++    effort: '',
++    headCost: 0,
++    headTokens: 0,
++    costIds: [],
++  }
++  for (const r of records) {
++    if (!meta.sessionId && r.type === 'session') {
++      if (isUuid(r.id)) meta.sessionId = r.id
++      if (r.timestamp) {
++        const t = Date.parse(r.timestamp)
++        if (!Number.isNaN(t)) meta.startedAt = t
++      }
++      if (typeof r.cwd === 'string') meta.cwd = r.cwd
++    }
++    if (!meta.model && r.type === 'model_change' && typeof r.modelId === 'string') {
++      meta.model = r.modelId
++    }
++    if (!meta.effort && r.type === 'thinking_level_change' && typeof r.thinkingLevel === 'string') {
++      meta.effort = r.thinkingLevel
++    }
++    if (!meta.firstUserText && r.type === 'message' && r.message?.role === 'user') {
++      const text = firstText(r.message.content)
++      if (text) meta.firstUserText = text.slice(0, PROMPT_MAX)
++    }
++    // Runtime-context records frame what the model is looking at — the Slack DM or channel a
++    // message arrived through lives here, ahead of or just behind the first user message.
++    if (
++      r.type === 'custom_message' &&
++      r.customType === 'openclaw.runtime-context' &&
++      typeof r.content === 'string' &&
++      meta.contextText.length < CONTEXT_MAX
++    ) {
++      meta.contextText += (meta.contextText ? '\n' : '') + r.content.slice(0, CONTEXT_MAX)
++    }
++    if (r.type === 'message' && r.message?.role === 'assistant') {
++      // The model can also ride on an assistant message when no `model_change` was written —
++      // keep looking for one until the model is known.
++      if (!meta.model && typeof r.message.model === 'string' && r.message.model) meta.model = r.message.model
++      // The first thing the worker *said* — thinking and tool calls skipped — is the best
++      // name a sub-agent session has, since its task text never reaches the transcript.
++      if (!meta.firstAssistantText) {
++        const text = firstText(r.message.content)
++        if (text) meta.firstAssistantText = text.slice(0, 1024)
++      }
++      const usage = r.message.usage
++      if (usage && typeof usage === 'object') {
++        if (typeof usage.cost?.total === 'number') meta.headCost += usage.cost.total
++        if (typeof usage.totalTokens === 'number') meta.headTokens += usage.totalTokens
++        // Ids of the records already counted, so the tail pass can skip them.
++        if (r.id) meta.costIds.push(r.id)
++      }
++    }
++  }
++  // The repo the session actually worked on, when the head names one — kept in the meta
++  // cache like everything else here, so the vote is counted once per changed file.
++  const detected = detectProject(records, meta.cwd)
++  if (detected) {
++    meta.project = detected.project
++    meta.projectPath = detected.projectPath
++  }
++  // The PR the session worked on, if the head names one — a merged PR is what turns an
++  // astronaut's status to celebrating, so it rides on the meta like the model does.
++  meta.pr = detectPr(records)
++  return meta
++}
++
++/**
++ * Whether a voted-for repo is really checked out. Answers are cached per path: the scan
++ * asks the same handful of questions thousands of times over, and a repo cloned after the
++ * server started is picked up the same way every other cached fact here is — when a
++ * transcript next moves.
++ */
++const repoOnDiskCache = new Map()
++async function repoOnDisk(p) {
++  let known = repoOnDiskCache.get(p)
++  if (known === undefined) {
++    known = await exists(p)
++    repoOnDiskCache.set(p, known)
++  }
++  return known
++}
++
++/**
++ * Head parsing is kept against mtime and size, so an unchanged transcript is read once. With
++ * thousands of session files and the scanner on a poll, this is what keeps the colony cheap
++ * to leave open — the same trick as `transcriptMeta` in `claude-code.mjs`.
++ */
++const metaCache = new Map()
++async function transcriptMeta(entry) {
++  const hit = metaCache.get(entry.file)
++  if (hit && hit.mtime === entry.mtime && hit.size === entry.size) return hit.meta
++  let meta
++  try {
++    meta = readTranscriptMeta(jsonLines(await readHead(entry.file, HEAD_BYTES)))
++  } catch {
++    /* mid-write, or gone — report nothing rather than half a session */
++    meta = readTranscriptMeta([])
++  }
++  // A vote only counts when the repo is really on the machine — one stray `brightfire/word`
++  // in a task text is not a project, and the zones are for repos you can walk to. Cwd-based
++  // answers are exempt: the cwd is where the thread ran, present or not.
++  if (meta.project && meta.projectPath !== meta.cwd && !(await repoOnDisk(meta.projectPath))) {
++    delete meta.project
++    delete meta.projectPath
++  }
++  // A session longer than the head spends most of its tokens after it, and the tail carries
++  // the latest usage records. Records already counted in the head are skipped by id, so a
++  // file small enough for the two chunks to overlap is never counted twice.
++  if (entry.size > HEAD_BYTES) {
++    try {
++      const seen = new Set(meta.costIds)
++      for (const r of jsonLines(await readTail(entry.file, TAIL_BYTES))) {
++        if (r.type !== 'message' || r.message?.role !== 'assistant') continue
++        const usage = r.message.usage
++        if (!usage || typeof usage !== 'object' || (r.id && seen.has(r.id))) continue
++        if (typeof usage.cost?.total === 'number') meta.headCost += usage.cost.total
++        if (typeof usage.totalTokens === 'number') meta.headTokens += usage.totalTokens
++      }
++    } catch {
++      /* mid-write — the head's numbers stand */
++    }
++  }
++  meta.totalCost = meta.headCost
++  meta.totalTokens = meta.headTokens
++  delete meta.headCost
++  delete meta.headTokens
++  delete meta.costIds
++  metaCache.set(entry.file, { mtime: entry.mtime, size: entry.size, meta })
++  return meta
++}
++
++/**
++ * Whether a transcript is being written right now. OpenClaw appends as the session runs, so
++ * the mtime narrows it and a growing file settles it: two stats a moment apart, and a size
++ * that moved means somebody is still typing. The probe only ever touches files that moved
++ * seconds ago — never the thousands of quiet ones, or the scan would spend itself waiting.
++ *
++ * A file that is *not* growing but was touched moments ago can still be live: the model is
++ * thinking — the user's message, a tool result, or a tool call is the last thing on disk and
++ * nothing has started streaming yet. The tail says which — a record that leaves work in
++ * flight means the session is running for all the colony cares; an assistant reply that said
++ * its piece and stopped means it is done. Only files inside the fresh window ever reach this
++ * far, so on a typical poll the tail read happens for a handful of files at most.
++ *
++ * "Unread" is deliberately not answered here. File mtimes cannot say whether a person has
++ * looked at a conversation, and guessing — anything that stopped growing moments ago must be
++ * awaiting a reply — flipped between polls, which showed as ghost "need you" counts that
++ * vanished between one click and the next. The thread is either running or it is not; whether
++ * you have read it is the colony's own bookkeeping (`viewedAt`), not the file's.
++ *
++ * "Thinking" is answered here, though, and it is the one thing the fresh-but-not-growing
++ * case can say for sure: a user record as the last thing on disk means input landed moments
++ * ago and the model has not written anything back yet — it is processing. The colony draws
++ * that as its own status (purple trim, thought bubbles) rather than folding it into
++ * "running", because watching a model think and watching a tool execute are different
++ * things to keep an eye on.
++ */
++/**
++ * Sticky state: once a session is detected as running or thinking, hold that state for
++ * at least this long even if subsequent probes say otherwise. Prevents the stat bar from
++ * flickering between polls — "1 building" should stay clickable.
++ */
++const STICKY_MS = 60_000
++const stickyCache = new Map()
++
++async function checkRunning(file, mtime) {
++  const now = Date.now()
++  const cached = stickyCache.get(file)
++
++  // If the file is genuinely stale (older than FRESH_WINDOW), check sticky cache
++  if (now - mtime > FRESH_WINDOW_MS) {
++    // Honour sticky state if still within its window
++    if (cached && now - cached.at < STICKY_MS) return { running: cached.running, thinking: cached.thinking }
++    stickyCache.delete(file)
++    return { running: false, thinking: false }
++  }
++  /** Persist a positive detection so the stat bar stays stable between polls. */
++  const stick = (result) => {
++    if (result.running || result.thinking) stickyCache.set(file, { ...result, at: now })
++    else stickyCache.delete(file)
++    return result
++  }
++
++  try {
++    const size1 = (await fsp.stat(file)).size
++    await new Promise((resolve) => setTimeout(resolve, PROBE_DELAY_MS))
++    const size2 = (await fsp.stat(file)).size
++    if (size2 > size1) return stick({ running: true, thinking: false })
++  } catch {
++    return stick({ running: false, thinking: false })
++  }
++  // Fresh but not growing: work can still be in flight. The last message record in the tail
++  // says which — a user record means the model is thinking about fresh input; a `toolResult`
++  // means the result just landed and the tool round is still open; an assistant record
++  // carrying a tool call means the tool is still executing. Only an assistant record that
++  // said its piece and stopped means the turn is over. Non-message records in between
++  // (model changes, context, customs) are machinery, not turns, and a tail with no message
++  // record at all says nothing either way.
++  try {
++    const records = jsonLines(await readTail(file, THINKING_TAIL_BYTES))
++    for (let i = records.length - 1; i >= 0; i--) {
++      const r = records[i]
++      if (r.type !== 'message' || !r.message) continue
++      const role = r.message.role
++      if (role === 'user') return stick({ running: false, thinking: true })
++      if (role === 'toolResult') return stick({ running: true, thinking: false })
++      if (role === 'assistant') {
++        const content = r.message.content
++        const inFlight =
++          Array.isArray(content) &&
++          content.some((p) => p && (p.type === 'toolCall' || p.type === 'tool_use'))
++        return stick({ running: inFlight, thinking: false })
++      }
++      return stick({ running: false, thinking: false })
++    }
++  } catch {
++    /* unreadable tail — the probe's answer stands: not running */
++  }
++  // No signal from the tail, but if we had a sticky positive state, honour it
++  if (cached && now - cached.at < STICKY_MS) return { running: cached.running, thinking: cached.thinking }
++  return { running: false, thinking: false }
++}
++
++/**
++ * The branch a session's cwd sits on, read off the checkout itself — no process is spawned.
++ * A worktree's `.git` is a pointer file to the main checkout's worktree metadata, whose
++ * `HEAD` names the branch; a plain checkout keeps `HEAD` under `.git/` directly. When
++ * neither is there to read, the machine's own naming convention is the last resort:
++ * worktrees live at `repos/<repo>-<branch>/`, so the tail of the path names the branch —
++ * split at the first dash, which is all the name alone can say. Results are cached per cwd;
++ * a branch is not something a session changes often.
++ */
++const branchCache = new Map()
++async function detectGitBranch(cwd) {
++  if (!cwd) return { branch: '', worktree: '' }
++  const hit = branchCache.get(cwd)
++  if (hit) return hit
++  let out = { branch: '', worktree: '' }
++  const gitPath = path.join(cwd, '.git')
++  const stat = await fsp.stat(gitPath).catch(() => null)
++  if (stat?.isFile()) {
++    // A worktree: `.git` holds a `gitdir: <path>` pointer, and that dir's HEAD the branch.
++    const text = await fsp.readFile(gitPath, 'utf8').catch(() => '')
++    const m = /^gitdir: (.+)$/m.exec(text.trim())
++    if (m) {
++      const branch = await branchFromHead(path.join(m[1], 'HEAD'))
++      if (branch) out = { branch, worktree: path.basename(m[1]) }
++    }
++  } else if (stat?.isDirectory()) {
++    const branch = await branchFromHead(path.join(gitPath, 'HEAD'))
++    if (branch) out = { branch, worktree: '' }
++  }
++  if (!out.branch) {
++    const m = /[\\/]repos[\\/][^-\\/]+-([^\\/]+)[\\/]?$/.exec(cwd)
++    if (m) out = { branch: m[1], worktree: m[1] }
++  }
++  branchCache.set(cwd, out)
++  return out
++}
++
++/** `ref: refs/heads/<branch>` out of a HEAD file, or '' when detached or unreadable. */
++async function branchFromHead(headFile) {
++  const text = await fsp.readFile(headFile, 'utf8').catch(() => '')
++  const m = /^ref: refs\/heads\/(.+)$/m.exec(text)
++  return m ? m[1].trim() : ''
++}
++
++/** Every transcript on disk, tagged with the agent it belongs to. */
++async function scanTranscripts() {
++  const out = []
++  for (const agentDir of await listDirs(AGENTS)) {
++    const agentId = path.basename(agentDir)
++    const sessions = path.join(agentDir, 'sessions')
++    for (const file of await listFiles(sessions, isTranscript)) {
++      let stat
++      try {
++        stat = await fsp.stat(file)
++      } catch {
++        continue
++      }
++      if (stat.size < MIN_SIZE) continue
++      out.push({ agentId, file, size: stat.size, mtime: stat.mtimeMs })
++    }
++  }
++  return out
++}
++
++function toThread(agentId, entry, meta, live, git) {
++  // The first message names the thread; a sub-agent's scaffolding never does, so the first
++  // thing the worker said stands in. Neither present — a delivery stub — is honestly untitled.
++  const fromUser = cleanMessage(meta.firstUserText)
++  const text = fromUser || cleanMessage(meta.firstAssistantText)
++  const prompt = text || 'Untitled session'
++  const cls = classifySession(agentId, meta.firstUserText)
++  const cwd = meta.cwd
++  // `source` says who ran it and what started it — `opus/subagent`, `main/webhook` — and a
++  // Slack origin rides on the end: `main/conversation/slack-dm`.
++  let source = `${agentId}/${cls.type}`
++  const slack = slackTagOf(meta.firstUserText, meta.contextText)
++  if (slack) source += `/${slack}`
++  // Cost rides on the model name so the card shows it with no UI change: an expensive
++  // session reads as `claude-opus-4-6 ($0.42)`.
++  const model =
++    meta.model && meta.totalCost > 0.01 ? `${meta.model} ($${meta.totalCost.toFixed(2)})` : meta.model
++  return {
++    id: ID(agentId, meta.sessionId),
++    title: clip(prompt, 80),
++    preview: clip(text, 240),
++    // The detected repo when the head named one, the cwd's own name otherwise — `project` is
++    // what claims a hex zone, so a workspace session that spent its whole head on c2 gets
++    // c2's plot instead of piling onto the shared workspace.
++    project: meta.project || path.basename(cwd) || 'unknown',
++    projectPath: meta.projectPath || cwd,
++    worktree: git.worktree,
++    cwd,
++    gitBranch: git.branch,
++    model,
++    effort: meta.effort,
++    createdAt: meta.startedAt || entry.mtime,
++    lastActivityAt: entry.mtime,
++    // No focus history exists outside the gateway's own UI, and no "unread" state either —
++    // see `checkRunning`. Whether you have looked at a thread is the colony's own
++    // bookkeeping, never this file's to say.
++    lastFocusedAt: 0,
++    unread: false,
++    running: live.running,
++    // The model is processing fresh input — nothing has been written back yet. Drawn by the
++    // colony as its own status, distinct from the tool-execution `running` above.
++    thinking: Boolean(live.thinking),
++    hasError: false,
++    starred: false,
++    routine: cls.routine,
++    // The PR the head named, and what it said happened to it — `MERGED` is the one the
++    // colony already knows how to celebrate. `''` is a PR with no state words: open, or
++    // simply unsaid.
++    prState: '',  // PR detection disabled — too noisy (tags webhooks as "shipped")
++    archived: false,
++    sizeBytes: entry.size,
++    // Which agent ran it — `main`, `opus`, a spawned worker — and what kind of session it
++    // was, is the one fact no other harness offers.
++    source,
++    canOpen: true,
++    ref: {
++      agentId,
++      sessionId: meta.sessionId,
++      cwd,
++      totalCost: meta.totalCost,
++      totalTokens: meta.totalTokens,
++      // The PR the session worked on, for the card's `#123` tag. Opaque to everything that
++      // consumes `ref` other than as a round-tripped token — `openThread` and
++      // `getTranscript` read only `agentId` and `sessionId` from it.
++      pr: meta.pr || null,
++    },
++  }
++}
++
++/**
++ * Two files can carry one session id — a topic continuation next to its parent transcript.
++ * The colony keys on `id`, and two threads sharing one would merge into a single astronaut;
++ * the fresher file wins and the quieter one is dropped, since they deep-link to the same place.
++ */
++function freshest(a, b) {
++  if (!a) return b
++  if (!b) return a
++  const keep = (a.lastActivityAt >= b.lastActivityAt ? a : b)
++  const other = keep === a ? b : a
++  return {
++    ...keep,
++    title: keep.title === 'Untitled session' ? other.title : keep.title,
++    preview: keep.preview || other.preview,
++    createdAt: Math.min(a.createdAt || Infinity, b.createdAt || Infinity) || 0,
++    sizeBytes: keep.sizeBytes,
++  }
++}
++
++async function scanThreads() {
++  const entries = await scanTranscripts()
++  const now = Date.now()
++  // Only transcripts that moved in the last two minutes can be running, and only those pay
++  // for the double-stat probe — the other few thousand answer from the mtime alone. The
++  // probes run together so their settle pauses overlap instead of stacking.
++  const probe = new Map()
++  await Promise.all(
++    entries
++      .filter((e) => now - e.mtime <= ACTIVE_WINDOW_MS)
++      .map(async (e) => probe.set(e.file, await checkRunning(e.file, e.mtime)))
++  )
++  const idle = { running: false, thinking: false }
++  const branches = new Map()
++  const byId = new Map()
++  for (const entry of entries) {
++    const meta = await transcriptMeta(entry)
++    // No session header means no id, and no id means nothing to deep-link or dedupe on —
++    // a file still being written is the normal cause. Skip it; the next poll will see it.
++    if (!meta.sessionId) continue
++    if (!branches.has(meta.cwd)) branches.set(meta.cwd, await detectGitBranch(meta.cwd))
++    const id = ID(entry.agentId, meta.sessionId)
++    byId.set(id, freshest(byId.get(id), toThread(entry.agentId, entry, meta, probe.get(entry.file) || idle, branches.get(meta.cwd))))
++  }
++  return [...byId.values()]
++}
++
++/**
++ * Hands the thread to OpenClaw's own web UI. The session key is the same one the UI addresses
++ * its tabs by — `agent:<agentId>:<sessionId>` — so the link lands on the conversation itself.
++ * Both halves of the ref are pattern-checked first: `ref` has made a round trip through the
++ * browser by the time it gets here, and a malformed one gets an honest refusal over a URL
++ * built out of whatever arrived.
++ */
++function openThread(ref) {
++  const { agentId, sessionId } = ref || {}
++  if (!isAgentId(agentId) || !isUuid(sessionId)) {
++    return { ok: false, error: 'No openable OpenClaw session on that thread' }
++  }
++  const key = encodeURIComponent(`agent:${agentId}:${sessionId}`)
++  return { ok: true, url: `${webUrl()}/chat?session=${key}` }
++}
++
++/**
++ * The conversation itself, read back out of a session's transcript for the chat panel on its
++ * card. Only what a person reading over the astronaut's shoulder would want: the user's
++ * messages and the assistant's replies, with the model that answered and whether tools were
++ * used along the way. Tool results are the machinery between the lines rather than the lines,
++ * and a reply that was nothing but a tool call has nothing to show — its `⚒` badge lands on
++ * the next reply that actually says something.
++ *
++ * The session's own transcript is preferred when both it and a topic continuation exist;
++ * otherwise the first continuation is the conversation, same as the scan's dedupe.
++ */
++async function getTranscript(ref) {
++  const { agentId, sessionId } = ref || {}
++  if (!isAgentId(agentId) || !isUuid(sessionId)) return { ok: false, error: 'Invalid ref' }
++
++  const sessionsDir = path.join(AGENTS, agentId, 'sessions')
++  const files = await listFiles(sessionsDir, (n) => n.startsWith(sessionId) && isTranscript(n))
++  if (!files.length) return { ok: false, error: 'Session not found' }
++  const file = files.find((f) => path.basename(f) === `${sessionId}.jsonl`) || files[0]
++
++  let text
++  try {
++    text = await readHead(file, TRANSCRIPT_MAX_BYTES)
++  } catch {
++    return { ok: false, error: 'Could not read session file' }
++  }
++
++  const messages = []
++  let pendingToolUse = false
++  for (const r of jsonLines(text)) {
++    if (r.type !== 'message') continue
++    const msg = r.message
++    if (!msg) continue
++    const role = msg.role
++    if (role !== 'user' && role !== 'assistant') continue
++
++    const content = msg.content
++    let body = ''
++    if (typeof content === 'string') {
++      body = content
++    } else if (Array.isArray(content)) {
++      body = content
++        .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
++        .map((p) => p.text)
++        .join('\n')
++    }
++
++    if (role === 'assistant' && Array.isArray(content)) {
++      // The transcript writes tool calls as `toolCall` parts (an Anthropic raw stream would
++      // spell it `tool_use`); either shape counts.
++      if (content.some((p) => p && (p.type === 'toolCall' || p.type === 'tool_use'))) pendingToolUse = true
++      // A reply that was only thinking and tool calls — nothing to show, but the badge
++      // carries forward to the reply that speaks.
++      if (!body.trim()) continue
++    }
++    if (!body.trim()) continue
++
++    messages.push({
++      role,
++      text: body.slice(0, TRANSCRIPT_MSG_MAX),
++      model: typeof msg.model === 'string' ? msg.model : '',
++      timestamp: typeof r.timestamp === 'string' ? r.timestamp : '',
++      hasToolUse: role === 'assistant' && pendingToolUse,
++    })
++    if (role === 'assistant') pendingToolUse = false
++  }
++
++  return { ok: true, messages }
++}
++
++/**
++ * OpenClaw sessions begin where a message arrives — Slack, or the web UI — not from a folder
++ * on disk. There is no `openclaw` deep link for "new session in this repo", and pretending
++ * otherwise would be a button that launches nothing.
++ */
++function newSession() {
++  return { ok: false, error: 'OpenClaw sessions are started through Slack or the web UI' }
++}
++
++export default {
++  id: 'openclaw',
++  name: 'OpenClaw',
++  /** Only claim this machine if the agents directory is actually there. */
++  detect: async () => exists(AGENTS),
++  scanThreads,
++  openThread,
++  getTranscript,
++  newSession,
++  paths: { AGENTS },
++}
+\ No newline at end of file
+diff --git a/server/scan.mjs b/server/scan.mjs
+index 0cb190b..158dd5f 100644
+--- a/server/scan.mjs
++++ b/server/scan.mjs
+@@ -118,3 +118,17 @@ const dispatch = (harnessId) => {
+ export const openThread = async (harnessId, ref) => dispatch(harnessId).openThread(ref)
+ 
+ export const newSession = async (harnessId, dir) => dispatch(harnessId).newSession(dir)
++
++/**
++ * The conversation behind a thread, for the chat panel on its card. Optional on an adapter —
++ * a harness whose store cannot be read back as messages says so, and the panel shows its
++ * empty state rather than pretending the conversation was blank.
++ */
++export async function getTranscript(harnessId, ref) {
++  const h = harnessById(harnessId)
++  if (!h) return { ok: false, error: `Unknown harness "${harnessId}"` }
++  if (typeof h.getTranscript !== 'function') {
++    return { ok: false, error: 'That harness does not support transcripts' }
++  }
++  return h.getTranscript(ref)
++}
+diff --git a/src/agents/astronauts.js b/src/agents/astronauts.js
+index 294bc01..8084d23 100644
+--- a/src/agents/astronauts.js
++++ b/src/agents/astronauts.js
+@@ -31,6 +31,7 @@ const SUIT_TONES = [0xf3f1ec, 0xe8e4dc, 0xf7f4ee, 0xdfe4e8, 0xf1e9df]
+ /** Trim + eye colour per behaviour. Eyes are pushed past 1.0 so the bloom pass catches them. */
+ const AGENT_LOOK = {
+   working: { trim: 0x4f9a63, eye: [0.35, 2.5, 1.15] },
++  thinking: { trim: 0x9070c8, eye: [1.8, 1.0, 3.0] },
+   waiting: { trim: 0x4f7ec9, eye: [0.45, 1.5, 3.0] },
+   blocked: { trim: 0xc94f4f, eye: [3.0, 0.5, 0.45] },
+   celebrating: { trim: 0xc9a24f, eye: [2.9, 2.1, 0.6] },
+@@ -1096,6 +1097,12 @@ export class Astronauts {
+         case 'working':
+           key = 'work'
+           break
++        // Standing and looking around rather than hammering: the model is processing, not
++        // building. `idleAlt` is the author's other idle loop, so a thinking astronaut is
++        // visibly *not* at work even before the purple trim and the bubbles land.
++        case 'thinking':
++          key = 'idleAlt'
++          break
+         case 'waiting':
+           key = 'wave'
+           break
+diff --git a/src/agents/indicators.js b/src/agents/indicators.js
+index 1a8a53c..6257b3f 100644
+--- a/src/agents/indicators.js
++++ b/src/agents/indicators.js
+@@ -3,6 +3,7 @@ import {
+   mdiHelpCircle,
+   mdiAlert,
+   mdiHammer,
++  mdiThoughtBubble,
+   mdiCheckBold,
+   mdiPause,
+   mdiSleep,
+@@ -20,7 +21,7 @@ import {
+  * when you have pulled the camera right out.
+  */
+ 
+-const COLS = 4
++const COLS = 5
+ const ROWS = 2
+ 
+ /** Where the badge's bottom edge sits: a shade above the crown of the helmet. */
+@@ -31,11 +32,12 @@ export const BADGE = {
+   waiting: 0, // waiting on you — the one that matters most
+   blocked: 1, // errored
+   working: 2,
+-  done: 3,
+-  paused: 4,
+-  sleeping: 5,
+-  spawning: 6,
+-  leaving: 7,
++  thinking: 3, // the model is processing — distinct from the hammering of `working`
++  done: 4,
++  paused: 5,
++  sleeping: 6,
++  spawning: 7,
++  leaving: 8,
+ }
+ 
+ /** Badge tint. Pushed past 1.0 so the bloom pass gives them a soft halo. */
+@@ -43,11 +45,12 @@ const BADGE_COLOR = {
+   0: [0.42, 1.35, 2.9],
+   1: [2.9, 0.6, 0.5],
+   2: [0.4, 1.9, 0.95],
+-  3: [1.5, 2.4, 0.8],
+-  4: [2.5, 1.9, 0.65],
+-  5: [0.9, 1.0, 1.7],
+-  6: [2.4, 1.4, 0.75],
+-  7: [1.2, 1.3, 1.35],
++  3: [1.0, 0.75, 1.6], // soft purple, past 1.0 in blue
++  4: [1.5, 2.4, 0.8],
++  5: [2.5, 1.9, 0.65],
++  6: [0.9, 1.0, 1.7],
++  7: [2.4, 1.4, 0.75],
++  8: [1.2, 1.3, 1.35],
+ }
+ 
+ /**
+@@ -59,6 +62,7 @@ const FADE_BY_BADGE = {
+   [BADGE.blocked]: 0,
+   [BADGE.done]: 0.15,
+   [BADGE.working]: 0.4,
++  [BADGE.thinking]: 0.4, // live, but not asking for anything — same presence as `working`
+   [BADGE.spawning]: 0.5,
+   [BADGE.leaving]: 0.5,
+   [BADGE.paused]: 0.6,
+@@ -256,7 +260,17 @@ export class Indicators {
+  * — the glyph has to carry as a silhouette. Material's set is drawn filled to begin with,
+  * one closed path per icon, so there is nothing to stroke and nothing to parse.
+  */
+-const ICON_PATHS = [mdiHelpCircle, mdiAlert, mdiHammer, mdiCheckBold, mdiPause, mdiSleep, mdiCreation, mdiLogout]
++const ICON_PATHS = [
++  mdiHelpCircle,
++  mdiAlert,
++  mdiHammer,
++  mdiThoughtBubble,
++  mdiCheckBold,
++  mdiPause,
++  mdiSleep,
++  mdiCreation,
++  mdiLogout,
++]
+ 
+ /**
+  * The badge atlas. Red channel = the glyph, green channel = the plate's alpha — packing two
+@@ -275,7 +289,7 @@ const ICON_PATHS = [mdiHelpCircle, mdiAlert, mdiHammer, mdiCheckBold, mdiPause,
+  * headroom for a larger display. The old 128 gave it three pixels per texel, which is why the
+  * corners came out stepped. The cells are square because the quad is: laying 4x2 cells on a
+  * square canvas spent twice as many texels down as across, and only across was ever the limit.
+- * 2048x1024 RGBA is 8 MB, which is the entire cost — the mip chain that distance reads from is
++ * 2560x1024 RGBA is 10 MB, which is the entire cost — the mip chain that distance reads from is
+  * unchanged, and the shadow's blur is set by a bias on the sampled level, so it stays put too.
+  */
+ function buildBadgeAtlas(cellSize = 512) {
+@@ -365,10 +379,10 @@ function platePath(ctx) {
+ }
+ 
+ /**
+- * The eight symbols, in atlas order: waiting, blocked, working, done, paused, sleeping,
+- * spawning, leaving.
++ * The nine symbols, in atlas order: waiting, blocked, working, thinking, done, paused,
++ * sleeping, spawning, leaving.
+  *
+- * Material Design Icons, imported as path data rather than drawn here. Eight symbols that have
++ * Material Design Icons, imported as path data rather than drawn here. Nine symbols that have
+  * to look like one family is a type problem — one weight, one optical size, one set of
+  * terminals — and a set somebody has already balanced beats one assembled a curve at a time.
+  */
+diff --git a/src/agents/particles.js b/src/agents/particles.js
+index 03fe9cb..c890fa7 100644
+--- a/src/agents/particles.js
++++ b/src/agents/particles.js
+@@ -319,6 +319,30 @@ export class Particles {
+     this.glow.spawn(x, y, z, 0.12, 0.42, 0.05, 0.55, 0.6, 1.1, 0.075, 1.9, 0.35, -0.02)
+   }
+ 
++  /**
++   * Thought bubbles — a soft purple dot drifting up off a pensive head. Same shape as the
++   * sleepy `z` but its own colour and a smaller size, so thinking and sleeping read as
++   * different things from across a plot even though both of them are "standing still".
++   */
++  thought(x, y, z) {
++    if (!this.enabled) return
++    this.glow.spawn(
++      x + (Math.random() - 0.5) * 0.1,
++      y,
++      z + (Math.random() - 0.5) * 0.1,
++      0.06,
++      0.26 + Math.random() * 0.16,
++      0.02,
++      0.72,
++      0.52,
++      1.2,
++      0.055 + Math.random() * 0.025,
++      1.5 + Math.random() * 0.6,
++      0.45,
++      -0.02
++    )
++  }
++
+   /**
+    * Planet haze — dust on Mars, pollen on Terra. Spawned in a ring around the camera so it
+    * is always where you are looking without simulating the whole world.
+diff --git a/src/core/settings.js b/src/core/settings.js
+index d43e742..e851b25 100644
+--- a/src/core/settings.js
++++ b/src/core/settings.js
+@@ -135,6 +135,19 @@ const DEFAULTS = {
+    * one click and a folded repo returns to the same ground the moment a thread wakes up.
+    */
+   hideDormant: true,
++  /**
++   * Archive sessions that have been dormant this many days, on the colony's own books only —
++   * the same thing clicking Archive does, done for you. Off by default: retiring astronauts
++   * without being asked is a bigger step than folding a zone away, and it should be chosen.
++   */
++  autoArchive: false,
++  autoArchiveDays: 30,
++  /**
++   * Tint each repo's sidebar swatch with the colour of the model its sessions use most.
++   * Off by default: the per-repo accent is the colony's own identity system, and the
++   * heatmap is a lens you put on deliberately rather than one that is always in the way.
++   */
++  modelHeatmap: false,
+   timeOfDay: 0.32, // 0..1 — 0 is midnight, 0.5 is noon
+   autoTime: false,
+   /** Sky follows this machine's own clock. Wins over `autoTime`; both off is manual. */
+diff --git a/src/game/api.js b/src/game/api.js
+index d31fc78..1561591 100644
+--- a/src/game/api.js
++++ b/src/game/api.js
+@@ -16,6 +16,20 @@ const post = (url, payload) =>
+ 
+ export const fetchThreads = () => req('/api/threads')
+ 
++/** Sessions matching a query, from the server's last scan. */
++export const searchThreads = (query) => req(`/api/search?q=${encodeURIComponent(query)}`)
++
++/**
++ * Session activity by hour, for the timeline panel. `from`/`to` are ISO strings; either
++ * may be omitted, in which case the server picks its own window (the last thirty days).
++ */
++export const fetchActivity = (from, to) => {
++  const params = new URLSearchParams()
++  if (from) params.set('from', from)
++  if (to) params.set('to', to)
++  return req(`/api/activity?${params}`)
++}
++
+ /**
+  * The colony file, and the base every later save is measured against.
+  *
+@@ -91,4 +105,7 @@ export const openThread = (thread) => post('/api/open', { harness: thread.harnes
+ /** A brand new thread in a repo, via that harness's own new-session deep link. */
+ export const newSession = (folder, harness) => post('/api/new-session', { folder, harness })
+ 
++/** The conversation behind a thread, for the chat panel on its card. */
++export const fetchTranscript = (thread) => post('/api/transcript', { harness: thread.harness, ref: thread.ref })
++
+ export const revealFolder = (folder) => post('/api/reveal', { folder })
+diff --git a/src/game/colony.js b/src/game/colony.js
+index bef826d..73d36ad 100644
+--- a/src/game/colony.js
++++ b/src/game/colony.js
+@@ -48,10 +48,26 @@ const LIVE_GROWTH = 0.004
+ /** How many zones' positions to remember, including repos with nothing running in them. */
+ const LAYOUT_MEMORY = 80
+ 
+-export const STATUS_ORDER = ['blocked', 'waiting', 'working', 'celebrating', 'idle', 'sleeping']
++/**
++ * The model heatmap: one colour per model, so a zone's swatch can say what its sessions
++ * think with rather than only which repo they are. Keys are matched by substring against
++ * the model id (which may arrive prefixed, `anthropic/claude-opus-4-6`), and anything
++ * unknown lands on the grey.
++ */
++const MODEL_COLORS = {
++  'claude-opus-4-6': 0x9070c8, // purple
++  'claude-sonnet-4-6': 0xc97050, // warm orange
++  'glm-5.3': 0x50a868, // green
++  'deepseek-v4-pro': 0x5080c0, // blue
++  'gemini-3.1-pro-preview': 0xc0a050, // gold
++}
++const DEFAULT_MODEL_COLOR = 0x8b8b85 // grey
++
++export const STATUS_ORDER = ['blocked', 'waiting', 'working', 'thinking', 'celebrating', 'idle', 'sleeping']
+ 
+ export const STATUS_LABEL = {
+   working: 'Working',
++  thinking: 'Thinking',
+   waiting: 'Waiting on you',
+   blocked: 'Blocked',
+   celebrating: 'Shipped',
+@@ -65,6 +81,9 @@ export const STATUS_LABEL = {
+ export function statusFor(thread, now = Date.now()) {
+   if (thread.hasError) return 'blocked'
+   if (thread.running) return 'working'
++  // The model is processing — streaming output or grinding through tools reads as `working`
++  // above; a session that took input moments ago and has written nothing back yet is this.
++  if (thread.thinking) return 'thinking'
+   if (thread.prState === 'MERGED') return 'celebrating'
+   if (thread.unread) return 'waiting'
+   if (now - thread.lastActivityAt > STALE_MS) return 'sleeping'
+@@ -80,6 +99,7 @@ const BADGE_FOR = {
+   waiting: BADGE.waiting,
+   blocked: BADGE.blocked,
+   working: BADGE.working,
++  thinking: BADGE.thinking,
+   celebrating: BADGE.done,
+   sleeping: BADGE.none,
+   idle: BADGE.none,
+@@ -160,7 +180,7 @@ export class Colony {
+     this.activePlots = new Set()
+     this._dustTint = new THREE.Color(this.planet.ground.high)
+     this._c = new THREE.Color()
+-    this.stats = { agents: 0, projects: 0, working: 0, waiting: 0, blocked: 0, done: 0 }
++    this.stats = { agents: 0, projects: 0, working: 0, thinking: 0, waiting: 0, blocked: 0, done: 0 }
+ 
+     this._buildTerrain()
+   }
+@@ -267,6 +287,45 @@ export class Colony {
+     const now = Date.now()
+     const live = liveThreadsForColony(threads, archivedIds, hiddenProjects)
+ 
++    /**
++     * The dominant model per project, for the heatmap. Model ids may carry a cost suffix
++     * ("claude-opus-4-6 ($0.42)") — only the first word is the model, so that is all that
++     * votes. Counted over the same live list the rest of the colony is built from, so the
++     * swatch and the astronauts always agree about who is standing where.
++     */
++    const modelsByProject = new Map()
++    for (const thread of live) {
++      if (!thread.model) continue
++      const baseModel = String(thread.model).split(' ')[0].toLowerCase()
++      if (!baseModel) continue
++      const key = thread.project || 'unknown'
++      const projModels = modelsByProject.get(key) || new Map()
++      projModels.set(baseModel, (projModels.get(baseModel) || 0) + 1)
++      modelsByProject.set(key, projModels)
++    }
++    const modelInfo = new Map()
++    for (const [name, models] of modelsByProject) {
++      let dominant = ''
++      let best = 0
++      for (const [model, count] of models) {
++        if (count > best) {
++          dominant = model
++          best = count
++        }
++      }
++      let color = DEFAULT_MODEL_COLOR
++      if (dominant) {
++        for (const [key, c] of Object.entries(MODEL_COLORS)) {
++          if (dominant.includes(key) || key.includes(dominant)) {
++            color = c
++            break
++          }
++        }
++      }
++      modelInfo.set(name, { color, model: dominant })
++    }
++    this.modelInfo = modelInfo
++
+     // Group by repo, biggest project first so the busiest work lands nearest the middle.
+     const byProject = new Map()
+     for (const thread of live) {
+@@ -320,6 +379,11 @@ export class Colony {
+     const seenBuildings = new Set()
+     const stats = { agents: 0, projects: projects.length }
+     for (const key of STATUS_ORDER) stats[key] = 0
++    // The crew behind each count, keyed by status, filled in by the same pass that counts
++    // them. The stat bar's buttons are sent to exactly these astronauts — see
++    // `focusStatus` in main.js — so a click can never land on a roster that a poll has
++    // since moved underneath the number the user saw.
++    const statusAgents = new Map()
+     // Plots holding anything that wants your attention get a pulsing rim, so you can spot
+     // the repo that needs you from right across the colony without reading a single label.
+     const urgent = new Set()
+@@ -336,8 +400,10 @@ export class Colony {
+       list.forEach((thread, i) => {
+         const status = statusFor(thread, now)
+         if (stats[status] !== undefined) stats[status]++
++        if (!statusAgents.has(status)) statusAgents.set(status, [])
++        statusAgents.get(status).push(thread.id)
+         if (status === 'waiting' || status === 'blocked') urgent.add(plot.id)
+-        if (status === 'waiting' || status === 'blocked' || status === 'working') active.add(plot.id)
++        if (status === 'waiting' || status === 'blocked' || status === 'working' || status === 'thinking') active.add(plot.id)
+         stats.agents++
+ 
+         const building = this._syncBuilding(thread, plot, i)
+@@ -367,7 +433,17 @@ export class Colony {
+     this.urgentPlots = urgent
+     this.activePlots = active
+     this._rebuildNavigation()
++    this.statusAgents = statusAgents
+     this.stats = { ...stats, done: stats.celebrating }
++    // Active threads (running, thinking, waiting, blocked) must always be in the visible
++    // set, regardless of the maxAgents cap. Without this the stat bar can count a thread
++    // that has no astronaut, and clicking "1 building" answers "nobody is working".
++    const activeStatuses = new Set(['working', 'thinking', 'waiting', 'blocked', 'celebrating'])
++    roster.sort((a, b) => {
++      const aActive = activeStatuses.has(a.status) ? 0 : 1
++      const bActive = activeStatuses.has(b.status) ? 0 : 1
++      return aActive - bActive || a.id.localeCompare(b.id)
++    })
+     this.astronauts.setRoster(roster, this._world())
+     return this.stats
+   }
+@@ -743,13 +819,13 @@ export class Colony {
+ 
+   _isLive(id) {
+     const thread = this.threads.get(id)
+-    return Boolean(thread && thread.running)
++    return Boolean(thread && (thread.running || thread.thinking))
+   }
+ 
+-  /** A site somebody is standing at: running, or stopped waiting on you. */
++  /** A site somebody is standing at: running, thinking, or stopped waiting on you. */
+   _isActive(id) {
+     const thread = this.threads.get(id)
+-    return Boolean(thread && (thread.running || thread.unread || thread.hasError))
++    return Boolean(thread && (thread.running || thread.thinking || thread.unread || thread.hasError))
+   }
+ 
+   _badgeFor(agent) {
+@@ -801,6 +877,12 @@ export class Colony {
+         this.particles.snooze(agent.pos.x + 0.2, agent.pos.y + 1.05, agent.pos.z + 0.15)
+       }
+ 
++      // Thought bubbles above a pensive head — gentler than sparks, and purple to match
++      // the trim, so the pose and the particles say the same thing.
++      if (agent.state === 'at-site' && agent.status === 'thinking' && Math.random() < dt * 0.8) {
++        this.particles.thought(agent.pos.x + 0.18, agent.pos.y + 1.08, agent.pos.z + 0.12)
++      }
++
+       // Boot dust, on the footfall.
+       if (full && (agent.walkAmp || 0) > 0.4) {
+         const step = Math.sin(agent.phase)
+diff --git a/src/main.js b/src/main.js
+index 6497ae5..0935b16 100644
+--- a/src/main.js
++++ b/src/main.js
+@@ -12,7 +12,10 @@ import { TIMES } from './world/sky.js'
+ import {
+   fetchThreads,
+   fetchState,
++  fetchTranscript,
++  fetchActivity,
+   saveState,
++  searchThreads,
+   openThread,
+   newSession,
+   revealFolder,
+@@ -49,6 +52,8 @@ const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer
+ 
+ let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
+ let threads = []
++/** Active timeline filter. null = show everything (live view). */
++let timeFilter = null // { from: epochMs, to: epochMs }
+ /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
+ let legendProjects = []
+ /** The zone layout as last written to the colony file, so an unchanged map is not re-saved. */
+@@ -105,7 +110,18 @@ const actions = {
+   /** Fly to the next astronaut in a given state, cycling through them on repeat presses. */
+   focusStatus: (status) => {
+     const key = status === 'agents' ? null : status
+-    const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
++    let pool
++    if (key && colony.statusAgents?.has(key)) {
++      // The ids the stat bar's own count was computed from, on the same pass that counted
++      // them — so the click always finds the crew the number described, even in the window
++      // between a poll landing and the astronauts' own `status` fields catching up. Without
++      // this, a count computed one poll ago could send the click at a roster that has since
++      // gone idle, and the button would answer "nobody" while the bar still said otherwise.
++      const ids = new Set(colony.statusAgents.get(key))
++      pool = colony.astronauts.agents.filter((a) => ids.has(a.id))
++    } else {
++      pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
++    }
+     if (!pool.length) {
+       hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
+       return
+@@ -226,7 +242,11 @@ const actions = {
+     const thread = threads.find((t) => t.id === selectedId)
+     if (!thread) return
+     try {
+-      await openThread(thread)
++      const result = await openThread(thread)
++      // A headless server cannot open http links itself — it hands them back here, and this
++      // page is what can. Custom schemes are left alone: the server has already launched
++      // the app that answers them, and opening one twice would.
++      if (result && result.url && /^https?:/i.test(result.url)) window.open(result.url, '_blank')
+       colony.astronauts.celebrate(thread.id)
+       hud.toast(`Opened in ${thread.harnessName || 'your harness'}`)
+       // Opening is the thing that makes a thread no longer unread, so refresh shortly after.
+@@ -269,6 +289,71 @@ const actions = {
+     const thread = threads.find((t) => t.id === id)
+     return thread ? transcriptProgress(thread) : 0
+   },
++
++  /** The conversation for the chat panel — failures become "no messages", never an error card. */
++  loadTranscript: async (thread) => {
++    try {
++      return await fetchTranscript(thread)
++    } catch {
++      return { ok: false, messages: [] }
++    }
++  },
++
++  /** Session search: debounced by the HUD, answered from the server's last scan. */
++  search: async (query) => {
++    if (!query || query.length < 2) return []
++    try {
++      const result = await searchThreads(query)
++      return result.results || []
++    } catch {
++      return []
++    }
++  },
++
++  /** Activity buckets for the timeline panel — a failure renders as empty, not an error. */
++  loadActivity: async (from, to) => {
++    try {
++      return await fetchActivity(from, to)
++    } catch {
++      return null
++    }
++  },
++
++  /**
++   * The timeline's time machine. When set, the colony only shows sessions that were
++   * active during the window — everything else folds away until the filter is cleared.
++   * `null` is the live view, where a session that starts a second from now walks down
++   * the ramp on the next poll, which a filter over all time never would.
++   */
++  setTimeFilter: (from, to) => {
++    if (from && to) {
++      timeFilter = {
++        from: from.getTime ? from.getTime() : from,
++        to: to.getTime ? to.getTime() : to,
++      }
++    } else {
++      timeFilter = null
++    }
++    applyThreads(threads)
++  },
++
++  /** A search result picked: close the panel and fly to that astronaut. */
++  selectSearchResult: (result) => {
++    hud.toggleSearch(false)
++    const threadId = result?.id
++    const agent = colony.agentFor(threadId)
++    if (!agent) {
++      // Archived, hidden or folded away — the session is in the harness but not on the
++      // map, and flying nowhere would read as the click having done nothing at all.
++      hud.hint(
++        result?.archived
++          ? 'That session is archived — it stays in your harness'
++          : 'That session is not on the map right now'
++      )
++      return
++    }
++    select(threadId, { fly: true })
++  },
+ }
+ 
+ const hud = new Hud(app, settings, actions)
+@@ -549,6 +634,16 @@ window.addEventListener('keydown', (e) => {
+     case 'V':
+       if (selectedId) actions.markViewed()
+       break
++    case 'f':
++    case 'F':
++    case '/':
++      e.preventDefault()
++      hud.toggleSearch()
++      break
++    case 't':
++    case 'T':
++      hud.toggleTimeline()
++      break
+     case 'c':
+     case 'C':
+       if (selectedProject) actions.newConversation()
+@@ -584,6 +679,8 @@ window.addEventListener('keydown', (e) => {
+     // One step at a time, outward: the thread, then the zone it belongs to.
+     case 'Escape':
+       if (document.querySelector('.help.open')) hud.toggleHelp(false)
++      else if (!document.querySelector('.timeline-panel.closed')) hud.toggleTimeline(false)
++      else if (!document.querySelector('.search-panel.closed')) hud.toggleSearch(false)
+       else if (selectedId) select(null, {})
+       else if (selectedProject) actions.closeProject()
+       break
+@@ -601,6 +698,32 @@ function applyThreads(list) {
+     return at && t.lastActivityAt <= at ? { ...t, unread: false } : t
+   })
+   list = threads
++
++  // Auto-archive: sessions dormant past the chosen line leave the map on their own —
++  // same list, same walk to the ship, exactly as if archived by hand. Capped per poll so
++  // turning the setting on with a hundred stale checkouts retires them in visible
++  // batches rather than emptying the colony in one click. Threads already archived are
++  // skipped by id, so this never re-archives anything.
++  if (settings.get('autoArchive')) {
++    const days = Number(settings.get('autoArchiveDays')) || 30
++    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
++    const already = new Set(state.archived)
++    const batch = []
++    for (const t of list) {
++      if (batch.length >= 50) break
++      if (t.archived || already.has(t.id)) continue
++      if (statusFor(t) !== 'sleeping' || (t.lastActivityAt ?? 0) >= cutoff) continue
++      batch.push(t.id)
++    }
++    if (batch.length) {
++      const at = Date.now()
++      state.archived = [...already, ...batch]
++      state.archivedAt = { ...state.archivedAt, ...Object.fromEntries(batch.map((id) => [id, at])) }
++      queueSave()
++      hud.toast(`Auto-archived ${batch.length} dormant session${batch.length === 1 ? '' : 's'}`)
++    }
++  }
++
+   const archivedSet = new Set(state.archived)
+   const hiddenSet = new Set(state.hiddenProjects || [])
+ 
+@@ -617,16 +740,37 @@ function applyThreads(list) {
+   }
+   if (firstSeen) queueSave()
+ 
+-  const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
++  // Apply the timeline filter — when one is set, only sessions active during the window
++  // are shown. A session is "in range" if it was alive at any point in the window: its
++  // last activity falls inside it, it was created inside it, or it spans the whole thing.
++  // Everything else leaves the map — buildings down, astronauts home, zones folded away —
++  // and comes back the moment the filter is cleared.
++  let filtered = list
++  if (timeFilter) {
++    filtered = list.filter((t) => {
++      const created = t.createdAt || 0
++      const active = t.lastActivityAt || created
++      return active >= timeFilter.from && created <= timeFilter.to
++    })
++  }
++
++  const stats = colony.setThreads(filtered, archivedSet, hiddenSet, known)
+   hud.setStats(stats)
+ 
+   legendProjects = colony.plotOrder
+-    .map((plot) => ({
+-      name: plot.name,
+-      accent: plot.accent,
+-      count: list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name).length,
+-      urgent: colony.urgentPlots?.has(plot.id) ?? false,
+-    }))
++    .map((plot) => {
++      const model = colony.modelInfo?.get(plot.name)
++      return {
++        name: plot.name,
++        accent: plot.accent,
++        count: filtered.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name).length,
++        urgent: colony.urgentPlots?.has(plot.id) ?? false,
++        // The zone's dominant model, for the model heatmap — colour and the model id itself,
++        // which the HUD turns into the label it shows.
++        modelColor: model?.color ?? null,
++        model: model?.model || '',
++      }
++    })
+     .sort((a, b) => b.count - a.count)
+ 
+   // Keep the card honest if the thread it is showing changed underneath it.
+@@ -739,6 +883,12 @@ settings.onChange((changed, scope) => {
+   // rebuilt from the list rather than merely re-rendered.
+   if (changed.has('hideDormant')) applyThreads(threads)
+   if (changed.has('maxAgents')) applyThreads(threads)
++  // So does the model heatmap: the legend re-renders from the same list, and a poll-sized
++  // wait before the swatches change would read as the toggle not working.
++  if (changed.has('modelHeatmap')) applyThreads(threads)
++  // So does turning auto-archive on or moving its line: the first poll-sized wait before
++  // anything happens would read as the toggle not working.
++  if (changed.has('autoArchive') || changed.has('autoArchiveDays')) applyThreads(threads)
+ })
+ 
+ // ── frame ─────────────────────────────────────────────────────────────────────────────
+diff --git a/src/ui/hud.js b/src/ui/hud.js
+index 66695b9..541cec8 100644
+--- a/src/ui/hud.js
++++ b/src/ui/hud.js
+@@ -44,10 +44,13 @@ const ICON = {
+   copy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>`,
+   locate: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7.6"/><path d="M12 1.8v2.6M12 19.6v2.6M1.8 12h2.6M19.6 12h2.6"/></svg>`,
+   orbit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10.2" ry="4.6" transform="rotate(-24 12 12)"/><circle cx="21" cy="8.2" r="1.5" fill="currentColor" stroke="none"/></svg>`,
++  search: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>`,
++  calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3.5V6M16 3.5V6"/></svg>`,
+ }
+ 
+ const STAT_DEFS = [
+   { key: 'working', label: 'building', cls: 'working' },
++  { key: 'thinking', label: 'thinking', cls: 'thinking' },
+   { key: 'waiting', label: 'need you', cls: 'waiting' },
+   { key: 'blocked', label: 'blocked', cls: 'blocked' },
+   { key: 'celebrating', label: 'shipped', cls: 'done' },
+@@ -240,12 +243,18 @@ export class Hud {
+         'Hide dormant repos',
+         'hideDormant',
+         'Takes a repo off the map when every thread in it has been quiet for three days. Its threads are untouched, and it comes back to the same ground the moment one wakes up.'
+-      )
++      ),
++      this._buildAutoArchive()
+     )
+     view.append(
+       this._toggle('Return to isometric', 'autoFrame', 'Eases the angle back when you stop dragging.'),
+       this._slider('Field of view', 'fov', 20, 60, 1, (v) => `${v}°`),
+       this._toggle('Project labels', 'showLabels'),
++      this._toggle(
++        'Color zones by model',
++        'modelHeatmap',
++        'Adds a swatch for each repo\u2019s dominant model beside its name, with a legend under the repo list.'
++      ),
+       this._toggle('Reduced motion', 'reducedMotion', 'Calms the bobbing and the camera easing.'),
+       this._toggle('Show FPS', 'showFps')
+     )
+@@ -262,6 +271,50 @@ export class Hud {
+     return row
+   }
+ 
++  /**
++   * Auto-archive: a toggle plus its “after how many days” detail row, shown only while the
++   * toggle is on. The number is clamped to the input's own bounds before it is saved, so a
++   * hand-typed 5 or 9999 lands on the nearest real setting rather than on nonsense.
++   */
++  _buildAutoArchive() {
++    const wrap = document.createElement('div')
++    wrap.append(
++      this._toggle(
++        'Auto-archive dormant sessions',
++        'autoArchive',
++        'Sessions that have been quiet for the chosen number of days are archived for you — they leave the map and head home, exactly as if you archived them by hand.'
++      )
++    )
++
++    const detail = document.createElement('div')
++    detail.className = 'setting-detail'
++    const label = document.createElement('label')
++    label.textContent = 'After '
++    const input = document.createElement('input')
++    input.type = 'number'
++    input.min = '7'
++    input.max = '365'
++    input.step = '1'
++    label.appendChild(input)
++    label.appendChild(document.createTextNode(' days dormant'))
++    detail.appendChild(label)
++    wrap.appendChild(detail)
++
++    input.addEventListener('change', () => {
++      const n = Math.max(7, Math.min(365, Math.round(Number(input.value)) || 30))
++      if (Number(input.value) !== n) input.value = String(n)
++      this.settings.set('autoArchiveDays', n)
++    })
++    this.controls.push({
++      el: detail,
++      sync: () => {
++        detail.hidden = !this.settings.get('autoArchive')
++        if (document.activeElement !== input) input.value = String(this.settings.get('autoArchiveDays') ?? 30)
++      },
++    })
++    return wrap
++  }
++
+   _toggle(label, key, hint) {
+     const row = this._row(label, hint)
+     const b = document.createElement('button')
+@@ -351,6 +404,10 @@ export class Hud {
+ 
+     on('#btn-settings', 'click', () => this.toggleSettings())
+     on('#btn-close-settings', 'click', () => this.toggleSettings(false))
++    on('#btn-search', 'click', () => this.toggleSearch())
++    on('#btn-close-search', 'click', () => this.toggleSearch(false))
++    on('#btn-timeline', 'click', () => this.toggleTimeline())
++    on('#btn-close-timeline', 'click', () => this.toggleTimeline(false))
+     on('#btn-hide', 'click', () => this.toggleUi())
+     on('#btn-help', 'click', () => this.toggleHelp())
+     on('#btn-shot', 'click', () => this.actions.screenshot?.())
+@@ -368,6 +425,7 @@ export class Hud {
+     on('#btn-copy-path', 'click', () => this.actions.copyProjectPath?.())
+     on('#btn-hide-project', 'click', () => this.actions.hideProject?.())
+     on('#btn-hidden-toggle', 'click', () => this.toggleHiddenList())
++    on('#btn-clear-filter', 'click', () => this._clearTimeFilter())
+     on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
+     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
+     on('.help', 'click', (e) => {
+@@ -377,6 +435,342 @@ export class Hud {
+     on('#btn-help-close', 'click', () => this.toggleHelp(false))
+ 
+     this.settings.onChange(() => this.syncSettings())
++
++    this._wireSearch()
++    this._wireTimeline()
++  }
++
++  // ── session search ─────────────────────────────────────────────────────────────────
++
++  /**
++   * The search box: debounced queries against the server's last scan, results rendered as
++   * a scrollable list. The query never runs for fewer than two characters, and a reply that
++   * arrives after the input has moved on is dropped — a slower early query overwriting a
++   * newer one's results is the kind of thing that reads as the search being broken.
++   */
++  _wireSearch() {
++    const input = this.$('#search-input')
++    const resultsEl = this.$('.search-results')
++    let timer = 0
++
++    input.addEventListener('input', () => {
++      clearTimeout(timer)
++      const q = input.value.trim()
++      if (!q) {
++        resultsEl.innerHTML = ''
++        return
++      }
++      timer = setTimeout(async () => {
++        const results = (await this.actions.search?.(q)) || []
++        if (input.value.trim() !== q) return
++        this._renderSearchResults(results, q)
++      }, 300)
++    })
++
++    input.addEventListener('keydown', (e) => {
++      // The page's own Escape handler steps aside for anything typed into (the guard on
++      // HTMLInputElement in main.js), so the field closes itself — and stops the event so
++      // the same press cannot also deselect an astronaut behind the panel.
++      if (e.key === 'Escape') {
++        e.stopPropagation()
++        this.toggleSearch(false)
++      }
++      // Enter takes the first result, the way every search box behaves.
++      if (e.key === 'Enter') {
++        const first = resultsEl.querySelector('.result')
++        if (first) first.click()
++      }
++    })
++  }
++
++  /** Results as a scrollable list — title, project, model, and how long since it moved. */
++  _renderSearchResults(results, q) {
++    const resultsEl = this.$('.search-results')
++    resultsEl.innerHTML = ''
++    if (!results.length) {
++      const empty = document.createElement('div')
++      empty.className = 'search-empty'
++      empty.textContent = `No sessions match “${q}”`
++      resultsEl.appendChild(empty)
++      return
++    }
++    for (const r of results) {
++      const b = document.createElement('button')
++      b.type = 'button'
++      b.className = 'result'
++      const meta = [r.project, r.model ? shortModel(r.model) : '', ago(r.lastActivityAt)]
++        .filter(Boolean)
++        .map((s) => escapeHtml(s))
++        .join(' · ')
++      b.innerHTML =
++        `<div class="result-title">${escapeHtml(r.title || 'Untitled session')}</div>` +
++        `<div class="result-meta">${meta}</div>`
++      b.addEventListener('click', () => this.actions.selectSearchResult?.(r))
++      resultsEl.appendChild(b)
++    }
++  }
++
++  toggleSearch(force) {
++    const panel = this.$('.search-panel')
++    const open = force ?? panel.classList.contains('closed')
++    panel.classList.toggle('closed', !open)
++    this.$('#btn-search').setAttribute('aria-pressed', String(open))
++    if (open) {
++      const input = this.$('#search-input')
++      input.value = ''
++      this.$('.search-results').innerHTML = ''
++      input.focus()
++    }
++  }
++
++  // ── activity timeline ────────────────────────────────────────────────────────────────
++
++  /**
++   * The timeline panel: preset ranges, a custom from/to pair, and a grid rebuilt whenever
++   * either moves. Presets are simple offsets from now; “All” asks from the distant past and
++   * lets the server's own list say where the data actually begins. Every range change also
++   * drives the colony's time filter, so the heatmap and the world always agree about which
++   * slice of time you are looking at.
++   */
++  _wireTimeline() {
++    for (const b of this.el.querySelectorAll('.timeline-panel [data-range]')) {
++      b.addEventListener('click', () => {
++        this.timelineRange = b.dataset.range
++        this._syncTimelineControls()
++        this._applyTimelineFilter()
++        this._loadTimeline()
++      })
++    }
++    const custom = () => {
++      this.timelineRange = 'custom'
++      this._syncTimelineControls()
++      this._applyTimelineFilter()
++      this._loadTimeline()
++    }
++    this.$('#timeline-from').addEventListener('change', custom)
++    this.$('#timeline-to').addEventListener('change', custom)
++    this.timelineRange = '30d'
++  }
++
++  /**
++   * Push the panel's range at the colony as well as the heatmap. A preset or custom range
++   * becomes the colony's window; “All” clears the filter entirely — the live view, where a
++   * session that starts a second from now walks down the ramp on the next poll, which a
++   * filter spanning all time never would.
++   */
++  _applyTimelineFilter() {
++    if (this.timelineRange === 'all') {
++      this._filterRange = null
++      this.actions.setTimeFilter?.(null)
++    } else {
++      const { from, to } = this._timelineWindow()
++      this._filterRange = { from, to }
++      this.actions.setTimeFilter?.(from, to)
++    }
++    this._syncFilterBadge()
++  }
++
++  /**
++   * The badge's ✕: exactly what pressing “All” in the panel does, from anywhere. Widening
++   * the heatmap too keeps the two views honest about the same range.
++   */
++  _clearTimeFilter() {
++    this.timelineRange = 'all'
++    this._syncTimelineControls()
++    this._applyTimelineFilter()
++    if (!this.$('.timeline-panel').classList.contains('closed')) this._loadTimeline()
++  }
++
++  /** The badge that says the colony is a slice of time, not the live thing. */
++  _syncFilterBadge() {
++    const badge = this.$('#time-filter-badge')
++    if (!this._filterRange) {
++      badge.hidden = true
++      return
++    }
++    badge.hidden = false
++    this.$('#time-filter-label').textContent = `Showing: ${this._filterLabel(this._filterRange)}`
++  }
++
++  /** Presets read as their own name; anything else reads as the dates it spans. */
++  _filterLabel({ from, to }) {
++    const fmt = (d) => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
++    if (dayKey(from) === dayKey(to)) {
++      return from.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
++    }
++    const days = Math.round((to.getTime() - from.getTime()) / 86400000)
++    if (Math.abs(days - 7) <= 1) return 'Last 7 days'
++    if (Math.abs(days - 30) <= 1) return 'Last 30 days'
++    if (Math.abs(days - 90) <= 1) return 'Last 90 days'
++    const year = from.getFullYear() !== to.getFullYear() ? ` ${to.getFullYear()}` : ''
++    return `${fmt(from)} – ${fmt(to)}${year}`
++  }
++
++  /** Presets light their own button; a custom range lights none of them. */
++  _syncTimelineControls() {
++    for (const b of this.el.querySelectorAll('.timeline-panel [data-range]')) {
++      b.classList.toggle('active', b.dataset.range === this.timelineRange)
++    }
++  }
++
++  toggleTimeline(force) {
++    const panel = this.$('.timeline-panel')
++    const open = force ?? panel.classList.contains('closed')
++    panel.classList.toggle('closed', !open)
++    this.$('#btn-timeline').setAttribute('aria-pressed', String(open))
++    if (open) this._loadTimeline()
++  }
++
++  /** The window the panel is currently looking at, as local Dates. */
++  _timelineWindow() {
++    const to = new Date()
++    if (this.timelineRange === 'all') return { from: new Date(2000, 0, 1), to }
++    if (this.timelineRange === 'custom') {
++      const from = parseDateInput(this.$('#timeline-from').value)
++      const customTo = parseDateInput(this.$('#timeline-to').value)
++      return {
++        from: from || new Date(to.getTime() - 30 * 86400000),
++        to: customTo ? endOfDay(customTo) : to,
++      }
++    }
++    const days = this.timelineRange === '7d' ? 7 : this.timelineRange === '90d' ? 90 : 30
++    return { from: new Date(to.getTime() - days * 86400000), to }
++  }
++
++  /**
++   * Fetch and draw. A reply that arrives after the range moved on is dropped by token, the
++   * same rule the search box lives by — an older answer overwriting a newer one's grid is
++   * what “the timeline is broken” looks like from the outside.
++   */
++  async _loadTimeline() {
++    const token = (this._timelineToken = (this._timelineToken || 0) + 1)
++    const { from, to } = this._timelineWindow()
++    // Presets keep the date inputs honest — “30d” shows as real dates, and editing either
++    // one switches to the custom range those two dates describe.
++    if (this.timelineRange !== 'custom') {
++      this.$('#timeline-from').value = toDateInput(from)
++      this.$('#timeline-to').value = toDateInput(to)
++    }
++    const grid = this.$('.timeline-grid')
++    const result = await this.actions.loadActivity?.(from.toISOString(), to.toISOString())
++    if (token !== this._timelineToken) return
++    if (!result || !result.buckets) {
++      grid.innerHTML = ''
++      const empty = document.createElement('div')
++      empty.className = 'timeline-empty'
++      empty.textContent = 'Could not read session activity'
++      grid.appendChild(empty)
++      return
++    }
++    this._renderTimeline(result.buckets, from, to)
++    // Kept so a filter change can repaint the grid's highlights without refetching —
++    // picking a day should move the outline, not blank the heatmap for a round trip.
++    this._lastBuckets = { buckets: result.buckets, from, to }
++  }
++
++  /**
++   * GitHub-style: a column per week, a row per weekday (Mon–Sun), one cell per day, tinted
++   * by how many sessions moved that day. The server buckets hourly; a day is just the sum
++   * of its hours, so the two views of the same data stay honest. While a colony filter is
++   * active, the days it covers are outlined and the rest step back; every in-window day is
++   * clickable, and picks that one day as the filter.
++   */
++  _renderTimeline(buckets, from, to) {
++    const days = new Map()
++    for (const [key, n] of Object.entries(buckets || {})) {
++      const day = key.slice(0, 10)
++      days.set(day, (days.get(day) || 0) + n)
++    }
++    const grid = this.$('.timeline-grid')
++    grid.innerHTML = ''
++    if (!days.size) {
++      const empty = document.createElement('div')
++      empty.className = 'timeline-empty'
++      empty.textContent = 'No sessions in this range'
++      grid.appendChild(empty)
++      return
++    }
++
++    // The colony filter, when one is set: days inside it are outlined, days outside it dim.
++    const filter = this._filterRange
++    const filterFrom = filter ? startOfDay(filter.from).getTime() : 0
++    grid.classList.toggle('filtered', Boolean(filter))
++
++    let max = 1
++    for (const n of days.values()) if (n > max) max = n
++
++    // From the Monday on/before `from`, so the first column is always a whole week.
++    const start = startOfDay(from)
++    start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
++    const end = startOfDay(to)
++
++    // Weekday gutter — Mon, Wed, Fri, the convention the shape comes from.
++    const gutter = document.createElement('div')
++    gutter.className = 'week-gutter'
++    for (const label of ['M', '', 'W', '', 'F', '', '']) {
++      const s = document.createElement('span')
++      s.textContent = label
++      gutter.appendChild(s)
++    }
++    grid.appendChild(gutter)
++
++    const frag = document.createDocumentFragment()
++    let lastMonth = -1
++    for (let w = new Date(start); w <= end; w = new Date(w.getFullYear(), w.getMonth(), w.getDate() + 7)) {
++      const week = document.createElement('div')
++      week.className = 'week'
++      const month = document.createElement('span')
++      month.className = 'month-label'
++      if (w.getMonth() !== lastMonth) {
++        month.textContent = w.toLocaleString(undefined, { month: 'short' })
++        lastMonth = w.getMonth()
++      }
++      week.appendChild(month)
++      for (let i = 0; i < 7; i++) {
++        const d = new Date(w.getFullYear(), w.getMonth(), w.getDate() + i)
++        const cell = document.createElement('i')
++        cell.className = 'day'
++        if (d < startOfDay(from) || d > end) {
++          // Outside the asked-for window: a placeholder keeps the column's shape without
++          // claiming anything about days the range does not cover.
++          cell.classList.add('out')
++        } else {
++          const n = days.get(dayKey(d)) || 0
++          cell.style.background = HEAT_LEVELS[n === 0 ? 0 : Math.min(4, Math.ceil((n / max) * 4))]
++          cell.title = `${d.toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })} — ${n} session${n === 1 ? '' : 's'}`
++          // The day this cell is, for the click that filters the colony to it.
++          cell.dataset.date = dayKey(d)
++          if (filter) {
++            cell.classList.toggle('in-range', d.getTime() >= filterFrom && d.getTime() <= filter.to.getTime())
++          }
++          cell.addEventListener('click', () => this._pickTimelineDay(d))
++        }
++        week.appendChild(cell)
++      }
++      frag.appendChild(week)
++    }
++    grid.appendChild(frag)
++  }
++
++  /**
++   * Clicking a day filters the colony to that one day. The heatmap keeps its window —
++   * seeing which slice you picked is the point — so the grid repaints from the data
++   * already in hand and only the highlight moves. The date inputs follow, because they
++   * describe the filter; the next range change realigns everything.
++   */
++  _pickTimelineDay(d) {
++    const from = startOfDay(d)
++    const to = endOfDay(d)
++    this.timelineRange = 'custom'
++    this.$('#timeline-from').value = toDateInput(from)
++    this.$('#timeline-to').value = toDateInput(to)
++    this._syncTimelineControls()
++    this._filterRange = { from, to }
++    this.actions.setTimeFilter?.(from, to)
++    this._syncFilterBadge()
++    if (this._lastBuckets) {
++      this._renderTimeline(this._lastBuckets.buckets, this._lastBuckets.from, this._lastBuckets.to)
++    }
+   }
+ 
+   // ── state in ────────────────────────────────────────────────────────────────────────
+@@ -403,9 +797,12 @@ export class Hud {
+    * can carry a count and an alarm without running out of room at eleven repos.
+    */
+   setLegend(projects, activeName = null, hidden = [], folded = []) {
++    const heat = Boolean(this.settings.get('modelHeatmap'))
+     const signature =
+-      projects.map((p) => `${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') +
+-      `~${activeName}~` +
++      projects
++        .map((p) => `${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}:${heat ? p.modelColor ?? 0 : 0}`)
++        .join('|') +
++      `~${activeName}~${heat ? 1 : 0}` +
+       hidden.map((p) => `${p.name}:${p.count}`).join('|') +
+       `~${folded.length}`
+     if (this._last.legend === signature) return
+@@ -419,9 +816,15 @@ export class Hud {
+       b.className = 'repo'
+       b.title = `${p.count} thread${p.count === 1 ? '' : 's'} in ${p.name}`
+       b.setAttribute('aria-pressed', String(p.name === activeName))
++      // With the model heatmap on, a second swatch beside the name says what the repo
++      // thinks with; the zone's own accent stays put, because it is how you find the repo
++      // on the map in the first place.
+       b.innerHTML =
+         `<i class="swatch" style="background:${hex(p.accent)};color:${hex(p.accent)}"></i>` +
+         `<span class="n">${escapeHtml(p.name)}</span>` +
++        (heat && p.modelColor != null
++          ? `<i class="model-swatch" style="background:${hex(p.modelColor)};color:${hex(p.modelColor)}" title="${escapeHtml(modelLabel(p.model))}"></i>`
++          : '') +
+         (p.urgent ? '<i class="alarm"></i>' : '') +
+         `<span class="count">${p.count}</span>`
+       b.addEventListener('click', () => this.actions.pickProject?.(p.name))
+@@ -429,6 +832,10 @@ export class Hud {
+     }
+     this.$('.sec-head span').textContent = `${projects.length} repo${projects.length === 1 ? '' : 's'}`
+ 
++    // The heatmap's own legend: one line of model → colour pairs, built from the zones
++    // actually on the map rather than a fixed list that might name models nobody ran.
++    this._renderModelLegend(heat ? projects : [])
++
+     // The hidden list is its own block at the foot of the sidebar: collapsed by default, because
+     // the whole point of hiding a repo is not to look at it.
+     const block = this.$('.hidden-block')
+@@ -482,6 +889,28 @@ export class Hud {
+     this._syncHiddenList()
+   }
+ 
++  /**
++   * The model → colour pairs for the heatmap, one entry per distinct model actually on the
++   * map. Hidden entirely (not just emptied) when the heatmap is off, so the sidebar's foot
++   * is only ever chrome that is doing something.
++   */
++  _renderModelLegend(projects) {
++    const el = this.$('.model-legend')
++    el.innerHTML = ''
++    const seen = new Map()
++    for (const p of projects) {
++      if (p.modelColor == null || !p.model) continue
++      const key = `${p.model}|${p.modelColor}`
++      if (!seen.has(key)) seen.set(key, { color: p.modelColor, model: p.model })
++    }
++    el.hidden = seen.size === 0
++    for (const { color, model } of seen.values()) {
++      const row = document.createElement('div')
++      row.innerHTML = `<i style="background:${hex(color)}"></i>${escapeHtml(modelLabel(model))}`
++      el.appendChild(row)
++    }
++  }
++
+   _syncHiddenList() {
+     this.$('#btn-hidden-toggle').setAttribute('aria-expanded', String(this.hiddenOpen))
+     this.$('.hidden-projects').hidden = !this.hiddenOpen
+@@ -579,6 +1008,11 @@ export class Hud {
+     if (!agent || !thread) {
+       card.classList.remove('on')
+       this.selected = null
++      // So the next pick of the same thread reloads its conversation rather than showing
++      // the one from before — the panel is down, whatever it held is spent.
++      this._transcriptId = null
++      this._stopTranscriptTail()
++      this.$('.transcript-live').hidden = true
+       return
+     }
+     this.selected = { agent, thread }
+@@ -593,6 +1027,15 @@ export class Hud {
+     // The repo is the panel's own heading now, so the card says what the *thread* is.
+     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
+     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
++    // The PR the session worked on, when the head named one — the number, with what
++    // happened to it in the tooltip.
++    if (thread.ref?.pr?.number) {
++      const pr = thread.ref.pr
++      const state =
++        ({ MERGED: 'merged', APPROVED: 'approved', CLOSED: 'closed', DRAFT: 'draft' }[pr.state] || 'open')
++      const title = escapeHtml(`PR #${pr.number}${pr.repo ? ` in ${pr.repo}` : ''} — ${state}`)
++      bits.push(`<span class="tag pr-tag" title="${title}">#${escapeHtml(String(pr.number))}</span>`)
++    }
+     if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
+     bits.push(`<span>${ago(thread.lastActivityAt)}</span>`)
+     meta.innerHTML = bits.join('')
+@@ -609,6 +1052,113 @@ export class Hud {
+     // crowd the two that are always worth having, and "Viewed" on a thread that is not asking
+     // for anything is a control with no effect.
+     this.$('#btn-viewed').hidden = !thread.unread
++    this._setOpenLabel(thread)
++    this._loadTranscript(thread)
++    this._armTranscriptTail(thread)
++  }
++
++  /** The open button names where the thread will open — "Open in OpenClaw", not a bare "Open". */
++  _setOpenLabel(thread) {
++    const label = thread.harnessName ? `Open in ${thread.harnessName}` : 'Open'
++    if (this._last.openLabel === label) return
++    this._last.openLabel = label
++    this.$('#btn-open .lbl').textContent = label
++  }
++
++  /**
++   * The conversation itself, in the card.
++   *
++   * Fetched once per selection: `setSelection` runs again on every poll for as long as a
++   * card is open, and rereading a transcript every fifteen seconds is a lot of disk for
++   * nothing new. The fetch never blocks the selection — the card appears immediately with
++   * its loading line, and the chat lands when it lands, re-measuring the card so it keeps
++   * clearing its astronaut and the window edge at its new height.
++   *
++   * Every word of the conversation is untrusted text from a file, so it is escaped before
++   * it touches `innerHTML` — the one place in this HUD that renders content it did not
++   * write itself.
++   */
++  _loadTranscript(thread) {
++    if (this._transcriptId === thread.id) return
++    this._transcriptId = thread.id
++    const card = this.$('.thread-pop')
++    const messagesEl = this.$('.transcript-messages')
++    const loadingEl = this.$('.transcript-loading')
++    const emptyEl = this.$('.transcript-empty')
++    const stale = () => this._transcriptId !== thread.id
++    messagesEl.innerHTML = ''
++    loadingEl.hidden = false
++    emptyEl.hidden = true
++
++    const pending = this.actions.loadTranscript?.(thread)
++    if (!pending || typeof pending.then !== 'function') {
++      loadingEl.hidden = true
++      emptyEl.hidden = false
++      return
++    }
++    pending.then((result) => {
++      if (stale()) return
++      loadingEl.hidden = true
++      if (!result || !result.ok || !result.messages?.length) {
++        emptyEl.hidden = false
++        return
++      }
++      messagesEl.innerHTML = renderMessages(result.messages)
++      // Newest at the bottom, like every chat you have ever read.
++      this.$('.transcript').scrollTop = messagesEl.scrollHeight
++      this._cardSize = { w: card.offsetWidth, h: card.offsetHeight }
++    }).catch(() => {
++      if (stale()) return
++      loadingEl.hidden = true
++      emptyEl.hidden = false
++    })
++  }
++
++  /**
++   * Live tail: a running or thinking session keeps its card's conversation fresh on its
++   * own, so watching the card is watching the session. Re-armed on every poll —
++   * `setSelection` runs again with fresh thread data, which is also what retires the tail
++   * once the session goes quiet, without the interval having to guess at state itself.
++   */
++  _armTranscriptTail(thread) {
++    this._stopTranscriptTail()
++    const live = Boolean(thread.running || thread.thinking)
++    this.$('.transcript-live').hidden = !live
++    if (!live) return
++    this._transcriptTail = setInterval(async () => {
++      // Only the card being looked at pays for polling; a tick landing after the user has
++      // moved on retires itself rather than rendering into a closed card.
++      if (this.selected?.thread?.id !== thread.id) {
++        this._stopTranscriptTail()
++        return
++      }
++      let result
++      try {
++        result = await this.actions.loadTranscript?.(thread)
++      } catch {
++        return
++      }
++      if (this.selected?.thread?.id !== thread.id || !result?.ok || !result.messages?.length) return
++      const scroller = this.$('.transcript')
++      const messagesEl = this.$('.transcript-messages')
++      // Follow the conversation only for someone already at the bottom — a reader scrolled
++      // up through history keeps their place.
++      const wasAtBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 20
++      messagesEl.innerHTML = renderMessages(result.messages)
++      this.$('.transcript-loading').hidden = true
++      this.$('.transcript-empty').hidden = true
++      if (wasAtBottom) scroller.scrollTop = messagesEl.scrollHeight
++      // The card's height is cached for placement, and the conversation just grew.
++      const card = this.$('.thread-pop')
++      this._cardSize = { w: card.offsetWidth, h: card.offsetHeight }
++    }, 3000)
++  }
++
++  _stopTranscriptTail() {
++    if (this._transcriptTail) {
++      clearInterval(this._transcriptTail)
++      this._transcriptTail = null
++    }
+   }
+ 
+   /**
+@@ -841,9 +1391,77 @@ function escapeHtml(s) {
+   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+ }
+ 
++/**
++ * One message row for the card's transcript — the one place that renders conversation
++ * content, shared by the initial load and the live tail so the two never drift apart in
++ * shape. Every word is untrusted text from a file, so it is escaped before it touches
++ * `innerHTML`.
++ */
++function renderMessages(messages) {
++  return messages
++    .map((m) => {
++      const cls = m.role === 'assistant' ? 'msg-assistant' : 'msg-user'
++      const label = m.role === 'assistant' ? (m.model ? shortModel(m.model) : 'Assistant') : 'You'
++      let text = String(m.text || '')
++      if (text.length > 1500) text = `${text.slice(0, 1500)}…`
++      const body = escapeHtml(text).replace(/\n/g, '<br>')
++      const t = m.timestamp ? new Date(m.timestamp) : null
++      const time = t && !Number.isNaN(t.getTime()) ? t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
++      const toolBadge = m.hasToolUse ? '<span class="tool-badge">⚒ used tools</span>' : ''
++      return (
++        `<div class="${cls}">` +
++        `<div class="msg-header"><span class="msg-role">${escapeHtml(label)}</span>${toolBadge}<span class="msg-time">${time}</span></div>` +
++        `<div class="msg-body">${body}</div>` +
++        `</div>`
++      )
++    })
++    .join('')
++}
++
++/** A model id a person would say — “Opus” rather than “anthropic/claude-opus-4-6”. */
++function modelLabel(model) {
++  const m = String(model || '').toLowerCase()
++  if (m.includes('opus')) return 'Opus'
++  if (m.includes('sonnet')) return 'Sonnet'
++  if (m.includes('haiku')) return 'Haiku'
++  if (m.includes('glm')) return 'GLM'
++  if (m.includes('deepseek')) return 'DeepSeek'
++  if (m.includes('gemini')) return 'Gemini'
++  if (m.includes('minimax')) return 'MiniMax'
++  if (m.includes('qwen')) return 'Qwen'
++  if (m.includes('kimi')) return 'Kimi'
++  if (m.includes('gpt') || m.includes('o3')) return 'GPT'
++  return shortModel(String(model)) || 'other'
++}
++
++// ── timeline helpers ───────────────────────────────────────────────────────────────────
++
++/** The five steps a day cell can sit on: empty, then four of increasing intensity. */
++const HEAT_LEVELS = [
++  'rgba(200, 140, 100, 0.08)',
++  'rgba(200, 140, 100, 0.28)',
++  'rgba(200, 140, 100, 0.52)',
++  'rgba(200, 140, 100, 0.76)',
++  'rgba(200, 140, 100, 1)',
++]
++
++const pad2 = (n) => String(n).padStart(2, '0')
++const dayKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
++const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate())
++const endOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999)
++/** `YYYY-MM-DD` (a date input's value, or a server bucket key's prefix) → the same shape. */
++const toDateInput = (d) => dayKey(d)
++
++/** A date input's `YYYY-MM-DD` → a local Date, or null for anything else. */
++function parseDateInput(value) {
++  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''))
++  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null
++}
++
+ /** Status → the colour family the top-bar counters already use for it. */
+ function statusClass(status) {
+   if (status === 'working') return 'working'
++  if (status === 'thinking') return 'thinking'
+   if (status === 'waiting') return 'waiting'
+   if (status === 'blocked') return 'blocked'
+   if (status === 'celebrating') return 'done'
+@@ -908,16 +1526,24 @@ const TEMPLATE = `
+     <div class="brand"><i class="dot"></i>Bot Crossing</div>
+     <button class="btn icon ghost" id="btn-shot" title="Screenshot (P)">${ICON.camera}</button>
+     <button class="btn icon ghost" id="btn-help" title="Help (?)">${ICON.help}</button>
++    <button class="btn icon ghost" id="btn-timeline" title="Activity timeline (T)" aria-pressed="false">${ICON.calendar}</button>
++    <button class="btn icon ghost" id="btn-search" title="Search sessions (F)" aria-pressed="false">${ICON.search}</button>
+     <button class="btn icon ghost" id="btn-hide" title="Hide all UI (H)">${ICON.eye}</button>
+     <button class="btn icon ghost" id="btn-settings" title="Settings (S)" aria-pressed="false">${ICON.settings}</button>
+   </header>
+ 
+   <div class="stats"></div>
+ 
++  <div class="time-filter-badge" id="time-filter-badge" hidden>
++    <span id="time-filter-label">Showing: last 30 days</span>
++    <button type="button" class="btn icon ghost" id="btn-clear-filter" title="Show all time — back to the live colony">✕</button>
++  </div>
++
+   <div class="side-body">
+     <div class="projects-pane">
+       <div class="sec-head"><span>Repos</span></div>
+       <div class="projects"></div>
++      <div class="model-legend" hidden></div>
+       <div class="hidden-block" hidden>
+         <button type="button" class="hidden-toggle" id="btn-hidden-toggle" aria-expanded="false">
+           <span class="label">0 hidden</span>
+@@ -964,6 +1590,38 @@ const TEMPLATE = `
+   <div class="body"></div>
+ </div>
+ 
++<div class="search-panel panel closed">
++  <div class="search-bar">
++    <input type="text" id="search-input" placeholder="Search sessions…" autocomplete="off" spellcheck="false" />
++    <button class="btn icon ghost" id="btn-close-search" title="Close (Esc)">${ICON.close}</button>
++  </div>
++  <div class="search-results"></div>
++</div>
++
++<div class="timeline-panel panel closed">
++  <header>
++    <span class="timeline-title">Activity Timeline</span>
++    <div class="timeline-controls">
++      <button type="button" class="btn small" data-range="7d">7d</button>
++      <button type="button" class="btn small active" data-range="30d">30d</button>
++      <button type="button" class="btn small" data-range="90d">90d</button>
++      <button type="button" class="btn small" data-range="all">All</button>
++      <input type="date" id="timeline-from" />
++      <input type="date" id="timeline-to" />
++    </div>
++    <button class="btn icon ghost" id="btn-close-timeline" title="Close (Esc)">${ICON.close}</button>
++  </header>
++  <div class="timeline-grid"></div>
++  <div class="timeline-legend">
++    <span>Less</span>
++    <i style="background:rgba(200,140,100,0.28)"></i>
++    <i style="background:rgba(200,140,100,0.52)"></i>
++    <i style="background:rgba(200,140,100,0.76)"></i>
++    <i style="background:rgba(200,140,100,1)"></i>
++    <span>More</span>
++  </div>
++</div>
++
+ <div class="thread-pop panel">
+   <i class="nib"></i>
+   <div class="top">
+@@ -975,8 +1633,14 @@ const TEMPLATE = `
+     <button class="btn icon ghost" id="btn-deselect" title="Deselect (Esc)">${ICON.close}</button>
+   </div>
+   <div class="progress"><i></i></div>
++  <div class="transcript">
++    <div class="transcript-live" hidden>● LIVE</div>
++    <div class="transcript-messages"></div>
++    <div class="transcript-loading">Loading conversation…</div>
++    <div class="transcript-empty">No messages in this session</div>
++  </div>
+   <div class="pair">
+-    <button class="btn primary" id="btn-open" title="Open this thread in the harness it came from (Enter)">${ICON.open} Open</button>
++    <button class="btn primary" id="btn-open" title="Open this thread in the harness it came from (Enter)">${ICON.open} <span class="lbl">Open</span></button>
+     <button class="btn" id="btn-viewed" title="Stop this thread asking for you until it moves on again (V)">${ICON.eye} Viewed</button>
+     <button class="btn" id="btn-archive" title="Archive — this astronaut walks back to the ship (A)">${ICON.archive} Archive</button>
+   </div>
+@@ -1000,6 +1664,7 @@ const TEMPLATE = `
+         <div class="k"><span>Reset view</span><kbd>0</kbd></div>
+         <div class="k"><span>Hide all UI</span><kbd>H</kbd> <kbd>${IS_MAC ? '⌘' : 'Ctrl'}\\</kbd></div>
+         <div class="k"><span>Settings</span><kbd>S</kbd></div>
++        <div class="k"><span>Activity timeline</span><kbd>T</kbd></div>
+         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
+       </div>
+       <div>
+@@ -1008,6 +1673,7 @@ const TEMPLATE = `
+         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
+         <div class="k"><span>Archive</span><kbd>A</kbd></div>
+         <div class="k"><span>New conversation</span><kbd>C</kbd></div>
++        <div class="k"><span>Search sessions</span><kbd>F</kbd> <kbd>/</kbd></div>
+         <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
+         <div class="k"><span>Change planet</span><kbd>Tab</kbd></div>
+         <div class="k"><span>Time of day</span><kbd>L</kbd></div>
+@@ -1019,6 +1685,7 @@ const TEMPLATE = `
+       <div class="legend-row"><i class="badge" style="background:#1a2b46;color:#8fb4ee">?</i> waiting on your reply — click to open the thread</div>
+       <div class="legend-row"><i class="badge" style="background:#3d1c1c;color:#e88b8b">!</i> the session hit an error</div>
+       <div class="legend-row"><i class="badge" style="background:#16301f;color:#7fd39a">⚒</i> running right now, building</div>
++      <div class="legend-row"><i class="badge" style="background:#2a1d3e;color:#b088e8">…</i> thinking — the model is processing</div>
+       <div class="legend-row"><i class="badge" style="background:#332b12;color:#e6c67f">✓</i> its pull request landed</div>
+       <div class="legend-row"><i class="badge" style="background:#1d1f2e;color:#a9a8c0">z</i> nothing for three days</div>
+     </div>
+diff --git a/src/ui/styles.css b/src/ui/styles.css
+index e433088..d5e8fdd 100644
+--- a/src/ui/styles.css
++++ b/src/ui/styles.css
+@@ -201,6 +201,43 @@ body {
+ 
+ /* ── settings ────────────────────────────────────────────────────────────────────── */
+ 
++/* The “after N days” row under a toggle, indented under the setting it belongs to. */
++.setting-detail {
++  padding: 0 2px 6px 14px;
++  font-size: 12.5px;
++  color: var(--muted);
++  cursor: default;
++}
++
++.setting-detail[hidden] {
++  display: none;
++}
++
++.setting-detail label {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++}
++
++.setting-detail input[type='number'] {
++  width: 58px;
++  height: 26px;
++  padding: 0 6px;
++  border-radius: 6px;
++  border: 1px solid var(--line);
++  background: rgba(0, 0, 0, 0.3);
++  color: inherit;
++  font: inherit;
++  font-size: 12.5px;
++  font-variant-numeric: tabular-nums;
++  text-align: center;
++  outline: none;
++}
++
++.setting-detail input[type='number']:focus {
++  border-color: var(--accent);
++}
++
+ .settings {
+   position: absolute;
+   /* Level with the sidebar it sits beside. The old 78px was clearing a top bar that no
+@@ -487,7 +524,7 @@ body {
+   position: absolute;
+   top: 0;
+   left: 0;
+-  width: 284px;
++  width: 360px;
+   padding: 11px;
+   display: none;
+   flex-direction: column;
+@@ -616,6 +653,136 @@ body {
+   flex: 1;
+   min-width: 0;
+   height: 34px;
++  /* The open button names its harness ("Open in OpenClaw"), so the row runs a step smaller */
++  /* than the rest of the HUD to keep all three on one line at the card's width. */
++  font-size: 12px;
++  padding: 0 9px;
++  gap: 6px;
++}
++
++/* ── the conversation, inside the card ─────────────────────────────────────────── */
++
++/* The scroller is the wrapper, so the card grows with the chat up to this ceiling and the
++   buttons stay put beneath it. */
++.thread-pop .transcript {
++  max-height: 320px;
++  overflow-y: auto;
++  border-radius: 6px;
++  background: rgba(0, 0, 0, 0.15);
++  padding: 8px;
++  scrollbar-width: thin;
++}
++
++.thread-pop .transcript-messages {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.thread-pop .transcript-loading,
++.thread-pop .transcript-empty {
++  color: var(--muted);
++  font-size: 12px;
++  text-align: center;
++  padding: 16px 8px;
++}
++
++.thread-pop .transcript-loading[hidden],
++.thread-pop .transcript-empty[hidden] {
++  display: none;
++}
++
++/* You on the right, the astronaut on the left — the shape every chat already has. */
++.thread-pop .msg-user,
++.thread-pop .msg-assistant {
++  padding: 6px 9px;
++  border-radius: 8px;
++  font-size: 12px;
++  line-height: 1.45;
++  max-width: 95%;
++  word-break: break-word;
++}
++
++.thread-pop .msg-user {
++  background: rgba(200, 140, 100, 0.2);
++  align-self: flex-end;
++  border-bottom-right-radius: 2px;
++}
++
++.thread-pop .msg-assistant {
++  background: rgba(100, 140, 200, 0.15);
++  align-self: flex-start;
++  border-bottom-left-radius: 2px;
++}
++
++.thread-pop .msg-header {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  margin-bottom: 3px;
++  font-size: 10px;
++  opacity: 0.7;
++}
++
++.thread-pop .msg-role {
++  font-weight: 600;
++}
++
++.thread-pop .msg-time {
++  margin-left: auto;
++}
++
++.thread-pop .msg-body {
++  white-space: pre-wrap;
++}
++
++.thread-pop .tool-badge {
++  font-size: 9px;
++  background: rgba(127, 211, 154, 0.2);
++  color: #7fd39a;
++  padding: 1px 5px;
++  border-radius: 3px;
++}
++
++/* The PR a session worked on, as a #number tag — green-tinted, like the ✓ it may earn. */
++.thread-pop .tag.pr-tag {
++  background: rgba(100, 180, 100, 0.2);
++  color: #7fd39a;
++}
++
++/* Live tail badge, pinned to the transcript's own top-right corner while the session
++   behind the card is running or thinking. */
++.thread-pop .transcript {
++  position: relative;
++}
++
++.transcript-live {
++  position: absolute;
++  top: 4px;
++  right: 6px;
++  z-index: 1;
++  font-size: 10px;
++  color: #7fd39a;
++  font-weight: 600;
++  padding: 1px 5px;
++  border-radius: 4px;
++  background: rgba(0, 0, 0, 0.45);
++  pointer-events: none;
++  animation: live-pulse 1.5s ease-in-out infinite;
++}
++
++.transcript-live[hidden] {
++  display: none;
++}
++
++@keyframes live-pulse {
++  0%,
++  100% {
++    opacity: 1;
++  }
++  50% {
++    opacity: 0.4;
++  }
+ }
+ 
+ .progress {
+@@ -728,8 +895,10 @@ body {
+   border-color: var(--line-strong);
+ }
+ 
++/* A count of zero is not a control — it is a dead button. Hidden entirely rather than
++   dimmed, so the bar only ever offers a click that goes somewhere. */
+ .stat[data-empty='true'] {
+-  opacity: 0.4;
++  display: none;
+ }
+ 
+ .stat .pip {
+@@ -751,6 +920,9 @@ body {
+ .stat.working {
+   color: #7fd39a;
+ }
++.stat.thinking {
++  color: #b088e8;
++}
+ .stat.waiting {
+   color: #8fb4ee;
+ }
+@@ -764,6 +936,38 @@ body {
+   color: #b6b5be;
+ }
+ 
++/* ── time filter badge ───────────────────────────────────────────────────────── */
++
++/* Between the counts and the repo list: the colony is a slice of time, not the live
++   thing, and this is what says so — with the way back. */
++.time-filter-badge {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  margin: 9px 15px;
++  align-self: flex-start;
++  flex: none;
++  background: rgba(200, 140, 100, 0.15);
++  border: 1px solid rgba(200, 140, 100, 0.3);
++  border-radius: 6px;
++  padding: 3px 4px 3px 10px;
++  font-size: 11px;
++  color: var(--accent);
++}
++
++.time-filter-badge[hidden] {
++  display: none;
++}
++
++.time-filter-badge .btn {
++  width: 22px;
++  min-width: 22px;
++  height: 22px;
++  font-size: 13px;
++  line-height: 1;
++  color: var(--accent);
++}
++
+ /* ── the two panes: every repo, or the one you picked ───────────────────────────── */
+ 
+ .side-body {
+@@ -873,7 +1077,7 @@ body {
+ .side .hidden-repo:hover { background: transparent; }
+ .side .hidden-repo .n { opacity: 0.72; }
+ 
+-.thread-pop .actions #btn-viewed[hidden] {
++.thread-pop #btn-viewed[hidden] {
+   display: none;
+ }
+ 
+@@ -929,6 +1133,46 @@ body {
+   color: var(--dim);
+ }
+ 
++/* The heatmap's second swatch, beside the name — smaller than the zone's own, so the
++   accent stays the thing you scan for and the model reads as the annotation it is. */
++.side .repo .model-swatch {
++  width: 7px;
++  height: 7px;
++  border-radius: 50%;
++  flex: none;
++  box-shadow: 0 0 7px currentColor;
++}
++
++/* The heatmap legend, at the foot of the repo list. */
++.model-legend {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 4px 12px;
++  padding: 8px 15px 10px;
++  border-top: 1px solid var(--line);
++  font-size: 10.5px;
++  color: var(--muted);
++  flex: none;
++}
++
++.model-legend[hidden] {
++  display: none;
++}
++
++.model-legend > div {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++}
++
++.model-legend i {
++  width: 9px;
++  height: 9px;
++  border-radius: 3px;
++  display: inline-block;
++  flex: none;
++}
++
+ .side .swatch {
+   width: 9px;
+   height: 9px;
+@@ -1129,6 +1373,9 @@ body {
+ .side .thread.working {
+   color: #7fd39a;
+ }
++.side .thread.thinking {
++  color: #b088e8;
++}
+ .side .thread.waiting {
+   color: #8fb4ee;
+ }
+@@ -1142,7 +1389,287 @@ body {
+   color: #7c7b86;
+ }
+ 
+-/* ── toasts + readouts ───────────────────────────────────────────────────────────── */
++/* ── search ────────────────────────────────────────────────────────────────────── */
++
++/* Left of the sidebar, which owns the right-hand edge — the same slot the settings panel
++   slides into from the far side, so the two never stack. */
++.search-panel {
++  position: absolute;
++  top: 14px;
++  right: calc(var(--side, 334px) + 28px);
++  width: 320px;
++  padding: 10px;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.search-panel.closed {
++  display: none;
++}
++
++.search-bar {
++  display: flex;
++  gap: 6px;
++  align-items: center;
++}
++
++.search-bar input {
++  flex: 1;
++  min-width: 0;
++  background: rgba(0, 0, 0, 0.3);
++  border: 1px solid var(--line);
++  border-radius: 8px;
++  padding: 8px 12px;
++  color: inherit;
++  font: inherit;
++  font-size: 13px;
++  outline: none;
++}
++
++.search-bar input:focus {
++  border-color: var(--accent);
++}
++
++.search-bar .btn {
++  flex: none;
++}
++
++.search-results {
++  max-height: 320px;
++  overflow-y: auto;
++  overscroll-behavior: contain;
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  scrollbar-width: thin;
++  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
++}
++
++.search-results::-webkit-scrollbar {
++  width: 8px;
++}
++
++.search-results::-webkit-scrollbar-thumb {
++  background: rgba(255, 255, 255, 0.14);
++  border-radius: 8px;
++}
++
++.search-results .result {
++  padding: 8px 10px;
++  border: 1px solid transparent;
++  border-radius: 8px;
++  background: transparent;
++  color: var(--text);
++  font: inherit;
++  text-align: left;
++  cursor: pointer;
++  pointer-events: auto;
++  transition: background 140ms ease, border-color 140ms ease;
++}
++
++.search-results .result:hover {
++  background: rgba(255, 255, 255, 0.07);
++  border-color: var(--line);
++}
++
++.search-results .result .result-title {
++  font-size: 12.5px;
++  font-weight: 500;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.search-results .result .result-meta {
++  font-size: 10.5px;
++  color: var(--dim);
++  margin-top: 2px;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.search-results .search-empty {
++  padding: 14px 8px;
++  font-size: 12px;
++  color: var(--muted);
++  text-align: center;
++}
++
++/* ── activity timeline ───────────────────────────────────────────────────────────── */
++
++/* Centred in the space the sidebar leaves, at the bottom of the screen where it covers
++   nothing the colony is doing. */
++.timeline-panel {
++  position: absolute;
++  bottom: 60px;
++  left: calc((100% - var(--side, 334px)) / 2);
++  transform: translateX(-50%);
++  width: min(86vw, 720px);
++  max-width: calc(100% - var(--side, 334px) - 28px);
++  padding: 14px;
++  z-index: 10;
++}
++
++.timeline-panel.closed {
++  display: none;
++}
++
++.timeline-panel header {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 10px;
++  font-weight: 600;
++}
++
++.timeline-panel .timeline-title {
++  white-space: nowrap;
++}
++
++.timeline-controls {
++  display: flex;
++  gap: 4px;
++  align-items: center;
++  margin-left: auto;
++  font-weight: normal;
++}
++
++.timeline-controls .btn.small {
++  height: 24px;
++  min-width: 0;
++  padding: 3px 8px;
++  font-size: 11px;
++  border-radius: 7px;
++}
++
++.timeline-controls .btn.small.active {
++  background: var(--accent);
++  border-color: transparent;
++  color: #fff;
++}
++
++.timeline-controls input[type='date'] {
++  background: rgba(0, 0, 0, 0.3);
++  border: 1px solid var(--line);
++  border-radius: 6px;
++  padding: 3px 6px;
++  color: inherit;
++  font: inherit;
++  font-size: 11px;
++  outline: none;
++}
++
++.timeline-controls input[type='date']:focus {
++  border-color: var(--accent);
++}
++
++.timeline-grid {
++  display: flex;
++  gap: 3px;
++  overflow-x: auto;
++  padding: 4px 0 2px;
++  scrollbar-width: thin;
++  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
++}
++
++.timeline-grid::-webkit-scrollbar {
++  height: 8px;
++}
++
++.timeline-grid::-webkit-scrollbar-thumb {
++  background: rgba(255, 255, 255, 0.14);
++  border-radius: 8px;
++}
++
++.timeline-grid .week-gutter {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  flex: none;
++  padding-top: 13px; /* clears the month-label row the week columns carry */
++}
++
++.timeline-grid .week-gutter span {
++  width: 12px;
++  height: 12px;
++  font-size: 9px;
++  line-height: 12px;
++  color: var(--dim);
++  text-align: center;
++}
++
++.timeline-grid .week {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  flex: none;
++}
++
++.timeline-grid .month-label {
++  height: 11px;
++  font-size: 9px;
++  color: var(--dim);
++  white-space: nowrap;
++}
++
++.timeline-grid .day {
++  width: 12px;
++  height: 12px;
++  border-radius: 2px;
++  background: rgba(200, 140, 100, 0.08);
++  flex: none;
++}
++
++.timeline-grid .day.out {
++  background: transparent;
++}
++
++/* Every real day is a filter pick: the cursor says so before the click does. */
++.timeline-grid .day[data-date] {
++  cursor: pointer;
++}
++
++.timeline-grid .day[data-date]:hover {
++  outline: 1px solid rgba(200, 140, 100, 0.65);
++}
++
++/* A colony filter active: the days it covers are outlined, the rest step back. */
++.timeline-grid.filtered .day:not(.in-range) {
++  opacity: 0.4;
++}
++
++.timeline-grid .day.in-range {
++  outline: 1px solid rgba(200, 140, 100, 0.5);
++}
++
++.timeline-grid .timeline-empty {
++  padding: 18px 8px;
++  font-size: 12px;
++  color: var(--muted);
++  text-align: center;
++  width: 100%;
++}
++
++.timeline-legend {
++  display: flex;
++  align-items: center;
++  gap: 3px;
++  font-size: 10px;
++  color: var(--muted);
++  margin-top: 8px;
++  justify-content: flex-end;
++}
++
++.timeline-legend i {
++  width: 12px;
++  height: 12px;
++  border-radius: 2px;
++  display: inline-block;
++}
++
++/* ── toasts + readouts ──────────────────────────────────────────────────────────── */
+ 
+ .toasts {
+   position: absolute;
+-- 
+2.43.0
+
+---UNCOMMITTED---
+diff --git a/server/harnesses/openclaw.mjs b/server/harnesses/openclaw.mjs
+index 84f47e3..f439fab 100644
+--- a/server/harnesses/openclaw.mjs
++++ b/server/harnesses/openclaw.mjs
+@@ -101,7 +101,7 @@ const isAgentId = (v) => typeof v === 'string' && AGENT_ID.test(v)
+ 
+ /** Where the web UI is. The gateway's own port, overridable for a non-default install. */
+ const webUrl = () =>
+-  (process.env.OPENCLAW_URL || `http://${process.env.OPENCLAW_HOST || 'localhost'}:${process.env.OPENCLAW_PORT || '18789'}`)
++  (process.env.OPENCLAW_URL || 'https://dojacat.ribfighter.ai')
+ 
+ /** Clip to a length, marking the cut with an ellipsis. */
+ const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s)
